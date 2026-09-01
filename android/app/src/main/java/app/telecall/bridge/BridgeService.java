@@ -46,7 +46,7 @@ public class BridgeService extends Service {
         startForeground(42, notification());
         registerCallStateReceiver();
         executor = Executors.newSingleThreadScheduledExecutor();
-        executor.scheduleWithFixedDelay(this::poll, 0, 3, TimeUnit.SECONDS);
+        executor.scheduleWithFixedDelay(this::poll, 0, 1, TimeUnit.SECONDS);
     }
 
     @Override
