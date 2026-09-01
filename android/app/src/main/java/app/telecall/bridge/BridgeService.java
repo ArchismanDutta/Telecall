@@ -107,7 +107,9 @@ public class BridgeService extends Service {
                 }
             }
         };
-        registerReceiver(callStateReceiver, new IntentFilter(TelephonyManager.ACTION_PHONE_STATE_CHANGED));
+        IntentFilter filter = new IntentFilter(TelephonyManager.ACTION_PHONE_STATE_CHANGED);
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(callStateReceiver, filter, Context.RECEIVER_EXPORTED);
+        else registerReceiver(callStateReceiver, filter);
     }
 
     private void postStatus(String callId, String status, int seconds) {

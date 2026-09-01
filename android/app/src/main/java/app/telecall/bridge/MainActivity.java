@@ -43,6 +43,7 @@ public class MainActivity extends Activity {
             preferences.edit().putString(DEVICE_ID, Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID)).apply();
         }
         buildScreen();
+        if (!preferences.getString(DEVICE_TOKEN, "").isEmpty()) startBridgeService();
     }
 
     private void buildScreen() {

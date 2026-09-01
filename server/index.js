@@ -25,6 +25,18 @@ const persist = () => {
 }
 
 const id = prefix => `${prefix}-${crypto.randomUUID()}`
+const normalizeUsername = value => String(value || '').trim().toLowerCase()
+const hashPassword = (password, salt = crypto.randomBytes(16).toString('hex')) => {
+  const digest = crypto.scryptSync(String(password), salt, 64).toString('hex')
+  return `${salt}:${digest}`
+}
+const passwordMatches = (password, storedHash) => {
+  const [salt, expectedHex] = String(storedHash || '').split(':')
+  if (!salt || !expectedHex) return false
+  const actual = crypto.scryptSync(String(password), salt, 64)
+  const expected = Buffer.from(expectedHex, 'hex')
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected)
+}
 const send = (response, status, payload) => {
   response.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
@@ -46,6 +58,17 @@ const readBody = request => new Promise((resolve, reject) => {
 
 const deviceForAgent = agent => agent?.deviceToken ? state.devices[agent.deviceToken] : null
 const isConnected = device => Boolean(device && Date.now() - device.lastSeen < 30_000)
+const publicAgent = agent => {
+  if (!agent) return null
+  const device = deviceForAgent(agent)
+  const { passwordHash, ...safeAgent } = agent
+  return {
+    ...safeAgent,
+    bridgeConnected: isConnected(device),
+    deviceName: device?.deviceName || '',
+    lastSeen: device ? 'Just now' : safeAgent.lastSeen || 'Never',
+  }
+}
 const contentTypes = { '.css': 'text/css; charset=utf-8', '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8', '.png': 'image/png', '.svg': 'image/svg+xml', '.webmanifest': 'application/manifest+json' }
 
 const serveApp = (response, pathname) => {
@@ -74,13 +97,72 @@ const server = http.createServer(async (request, response) => {
   if (route === '/api/health' && request.method === 'GET') return send(response, 200, { ok: true })
 
   try {
+    if (route === '/api/agents' && request.method === 'GET') {
+      return send(response, 200, Object.values(state.agents).map(publicAgent))
+    }
+
+    if (route === '/api/agents' && request.method === 'POST') {
+      const body = await readBody(request)
+      const username = normalizeUsername(body.username)
+      if (!body.name || !username || !body.password) return send(response, 400, { error: 'name, username and password are required' })
+      if (Object.values(state.agents).some(agent => normalizeUsername(agent.username) === username)) return send(response, 409, { error: 'That username is already in use' })
+      const agentId = body.id || body.agentId || id('agent')
+      const names = String(body.name).trim().split(/\s+/)
+      const initials = names.map(name => name[0]).join('').slice(0, 2).toUpperCase()
+      const agent = {
+        id: agentId,
+        name: String(body.name).trim(),
+        username,
+        passwordHash: hashPassword(body.password),
+        status: body.status || 'Active',
+        presence: 'Offline',
+        initials,
+        callsToday: 0,
+        talkTime: '0s',
+        connected: null,
+        lastSeen: 'Never',
+        bridgeConnected: false,
+        color: body.color || 'mint',
+        updatedAt: Date.now(),
+      }
+      state.agents[agentId] = agent
+      persist()
+      return send(response, 201, publicAgent(agent))
+    }
+
+    if (route === '/api/agents/login' && request.method === 'POST') {
+      const body = await readBody(request)
+      const username = normalizeUsername(body.username)
+      const agent = Object.values(state.agents).find(item => normalizeUsername(item.username) === username)
+      if (!agent) return send(response, 404, { error: 'No agent account matches that username' })
+      if (agent.status !== 'Active') return send(response, 403, { error: 'This agent account is not active' })
+      if (!agent.passwordHash) {
+        // Accounts created by the first prototype did not store a password.
+        // Treat the first successful login as a one-time password migration.
+        if (!body.password) return send(response, 401, { error: 'A password is required' })
+        agent.passwordHash = hashPassword(body.password)
+        persist()
+        return send(response, 200, publicAgent(agent))
+      }
+      if (!passwordMatches(body.password, agent.passwordHash)) return send(response, 401, { error: 'Incorrect username or password' })
+      return send(response, 200, publicAgent(agent))
+    }
+
     if (route === '/api/agents/sync' && request.method === 'POST') {
       const body = await readBody(request)
       if (!body.agentId || !body.username) return send(response, 400, { error: 'agentId and username are required' })
       const existing = state.agents[body.agentId] || {}
-      state.agents[body.agentId] = { ...existing, id: body.agentId, username: body.username, status: body.status || 'Active', updatedAt: Date.now() }
+      state.agents[body.agentId] = {
+        ...existing,
+        id: body.agentId,
+        username: normalizeUsername(body.username),
+        name: body.name || existing.name || body.username,
+        status: body.status || existing.status || 'Active',
+        ...(body.password && !existing.passwordHash ? { passwordHash: hashPassword(body.password) } : {}),
+        updatedAt: Date.now(),
+      }
       persist()
-      return send(response, 200, { ok: true })
+      return send(response, 200, { ok: true, agent: publicAgent(state.agents[body.agentId]) })
     }
 
     if (route === '/api/pairing/start' && request.method === 'POST') {
