@@ -27,6 +27,7 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.Scanner;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -54,7 +55,8 @@ public class BridgeService extends Service {
     /** How long the radio may stay idle after dialling before the call is written off. */
     private static final long DIAL_GRACE_MS = 25_000L;
 
-    private ScheduledExecutorService executor;
+    private ScheduledExecutorService executor;   // call-state polling only
+    private ExecutorService network;             // outbound reports, kept off the polling thread
     private TelephonyManager telephony;
     private Object callStateListener;
     private volatile int lastState = TelephonyManager.CALL_STATE_IDLE;
@@ -66,6 +68,7 @@ public class BridgeService extends Service {
         startForeground(42, notification());
         telephony = (TelephonyManager) getSystemService(TELEPHONY_SERVICE);
         executor = Executors.newSingleThreadScheduledExecutor();
+        network = Executors.newFixedThreadPool(2);
         registerCallStateListener();
         lastState = readCallState();
         executor.scheduleWithFixedDelay(this::poll, 0, 1, TimeUnit.SECONDS);
@@ -158,8 +161,9 @@ public class BridgeService extends Service {
                 clearActiveCall();
                 return;
             }
-            // The call log is written a moment after the call ends.
-            executor.schedule(() -> finishCall(callId, offhookAt, idleAt), 1400, TimeUnit.MILLISECONDS);
+            // The call log is written some time after the call ends, so this waits for it on
+            // its own thread rather than blocking the one-second state poll.
+            new Thread(() -> finishCall(callId, offhookAt, idleAt), "telecall-finish").start();
         }
     }
 
@@ -174,7 +178,7 @@ public class BridgeService extends Service {
      */
     private void finishCall(String callId, long offhookAt, long idleAt) {
         String number = pref(ACTIVE_NUMBER);
-        Integer talkSeconds = callLogDuration(number);
+        Integer talkSeconds = awaitCallLogDuration(number, offhookAt);
 
         if (talkSeconds == null) {
             int busySeconds = (int) Math.max(0, (idleAt - offhookAt) / 1000);
@@ -188,24 +192,51 @@ public class BridgeService extends Service {
         clearActiveCall();
     }
 
-    /** Connected seconds for the most recent outgoing call to this number, or null if unknown. */
-    private Integer callLogDuration(String number) {
+    /**
+     * Android writes the call-log row a little after the call ends, and how long it takes
+     * varies by device. Reading once and taking whatever is there is how a repeat call to the
+     * same number ends up reporting the *previous* call's duration -- which is exactly what
+     * happens when the same number is dialled twice while testing. So this waits for the row
+     * belonging to this call to appear, and never settles for an older one.
+     */
+    private Integer awaitCallLogDuration(String number, long offhookAt) {
+        for (int attempt = 0; attempt < 10; attempt++) {
+            Integer duration = callLogDuration(number, offhookAt);
+            if (duration != null) return duration;
+            try {
+                Thread.sleep(800);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Connected seconds for this call, or null if its row is not in the log yet.
+     *
+     * `notBefore` is when the line went busy. The log's DATE column is when dialling started,
+     * so any row older than that belongs to an earlier call and must be ignored -- a small
+     * tolerance covers the gap between the two clocks.
+     */
+    private Integer callLogDuration(String number, long notBefore) {
         if (checkSelfPermission(Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) return null;
         String tail = number.replaceAll("[^0-9]", "");
         if (tail.length() > 7) tail = tail.substring(tail.length() - 7);
+        long floor = notBefore - 3_000L;
         Cursor cursor = null;
         try {
             cursor = getContentResolver().query(
                     CallLog.Calls.CONTENT_URI,
                     new String[]{CallLog.Calls.NUMBER, CallLog.Calls.DURATION, CallLog.Calls.DATE},
-                    CallLog.Calls.TYPE + " = ?",
-                    new String[]{String.valueOf(CallLog.Calls.OUTGOING_TYPE)},
+                    CallLog.Calls.TYPE + " = ? AND " + CallLog.Calls.DATE + " >= ?",
+                    new String[]{String.valueOf(CallLog.Calls.OUTGOING_TYPE), String.valueOf(floor)},
                     CallLog.Calls.DATE + " DESC LIMIT 5");
             if (cursor == null) return null;
             while (cursor.moveToNext()) {
                 String logged = cursor.getString(0) == null ? "" : cursor.getString(0).replaceAll("[^0-9]", "");
-                long when = cursor.getLong(2);
-                if (System.currentTimeMillis() - when > 5 * 60_000L) continue;
+                if (cursor.getLong(2) < floor) continue;
                 if (tail.isEmpty() || logged.endsWith(tail)) return (int) cursor.getLong(1);
             }
             return null;
@@ -329,7 +360,7 @@ public class BridgeService extends Service {
         String baseUrl = pref(SERVER);
         String token = pref(TOKEN);
         if (baseUrl.isEmpty() || token.isEmpty() || callId.isEmpty()) return;
-        executor.execute(() -> {
+        network.execute(() -> {
             try {
                 JSONObject body = new JSONObject();
                 body.put("token", token);
@@ -349,8 +380,8 @@ public class BridgeService extends Service {
     private JSONObject getJson(String endpoint) throws Exception {
         HttpURLConnection connection = (HttpURLConnection) new URL(endpoint).openConnection();
         connection.setRequestMethod("GET");
-        connection.setConnectTimeout(10_000);
-        connection.setReadTimeout(15_000);
+        connection.setConnectTimeout(5_000);
+        connection.setReadTimeout(8_000);
         int code = connection.getResponseCode();
         Scanner scanner = new Scanner(code >= 400 ? connection.getErrorStream() : connection.getInputStream()).useDelimiter("\\A");
         String response = scanner.hasNext() ? scanner.next() : "{}";
@@ -403,6 +434,7 @@ public class BridgeService extends Service {
         } catch (Exception ignored) {
         }
         if (executor != null) executor.shutdownNow();
+        if (network != null) network.shutdownNow();
         super.onDestroy();
     }
 

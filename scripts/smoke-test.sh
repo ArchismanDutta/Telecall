@@ -127,16 +127,30 @@ curl -s -X POST $BASE/api/calls/$CALL4/status -H 'Content-Type: application/json
 check "a zero-length Answered is not stored as zero"  "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL4 | json '.seconds > 50 ? "recovered" : "still zero"')" recovered
 check "and it is flagged as an estimate"              "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL4 | json '.estimated')" true
 
+echo; echo "Talk time cannot exceed the time the line was busy"
+CALL5=$(curl -s -b $AGENT_JAR -X POST $BASE/api/calls/dispatch -H 'Content-Type: application/json' -d '{"number":"+919000000004"}' | json '.callId')
+curl -s "$BASE/api/devices/commands?token=$TOKEN" > /dev/null
+NOW5=$(node -pe 'Date.now()'); BUSY5=$((NOW5 - 20000))
+curl -s -X POST $BASE/api/calls/$CALL5/status -H 'Content-Type: application/json' \
+  -d "{\"token\":\"$TOKEN\",\"status\":\"In progress\",\"offhookAtMs\":$BUSY5}" > /dev/null
+# The phone matches an older, longer call-log row and claims 600s on a 20s call.
+curl -s -X POST $BASE/api/calls/$CALL5/status -H 'Content-Type: application/json' \
+  -d "{\"token\":\"$TOKEN\",\"status\":\"Answered\",\"seconds\":600,\"offhookAtMs\":$BUSY5,\"endedAtMs\":$NOW5}" > /dev/null
+check "an impossible talk time is clamped"           "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL5 | json '.seconds <= 22 ? "clamped" : "accepted"')" clamped
+check "and flagged rather than trusted"              "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL5 | json '.estimated')" true
+
 echo; echo "Build stamp"
 check "health reports the call-timing contract"       "$(curl -s $BASE/api/health | json '.build.features.includes("call-log-timing")')" true
 
 echo; echo "Visibility"
-check "the ADMIN sees the telecaller's calls"         "$(curl -s -b $JAR "$BASE/api/calls?userId=$PID" | json '.length')" 4
-check "the telecaller sees their own calls"           "$(curl -s -b $AGENT_JAR $BASE/api/calls | json '.length')" 4
-check "today's counter reflects the calls"            "$(curl -s -b $JAR $BASE/api/telecallers | json '[0].callsToday')" 4
-check "talk time is aggregated"                       "$(curl -s -b $JAR $BASE/api/telecallers | json '[0].talkTodaySeconds >= 518 ? "summed" : "wrong"')" summed
+check "the ADMIN sees the telecaller's calls"         "$(curl -s -b $JAR "$BASE/api/calls?userId=$PID" | json '.length')" 5
+check "the telecaller sees their own calls"           "$(curl -s -b $AGENT_JAR $BASE/api/calls | json '.length')" 5
+check "today's counter reflects the calls"            "$(curl -s -b $JAR $BASE/api/telecallers | json '[0].callsToday')" 5
+TOTAL=$(curl -s -b $JAR $BASE/api/telecallers | json '[0].talkTodaySeconds')
+SUMMED=$(curl -s -b $AGENT_JAR $BASE/api/calls | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")).reduce((t,c)=>t+c.seconds,0)')
+check "talk time is the sum of the calls ($TOTAL s)"  "$TOTAL" "$SUMMED"
 OTHER=$(curl -s -b $JAR -X POST $BASE/api/telecallers -H 'Content-Type: application/json' -d '{"name":"Rahul Verma","username":"rahul","password":"rahul123"}' | json '.id')
-check "a telecaller's userId filter is ignored"       "$(curl -s -b $AGENT_JAR "$BASE/api/calls?userId=$OTHER" | json '.length')" 4
+check "a telecaller's userId filter is ignored"       "$(curl -s -b $AGENT_JAR "$BASE/api/calls?userId=$OTHER" | json '.length')" 5
 check "a date range outside the call excludes it"     "$(curl -s -b $JAR "$BASE/api/calls?userId=$PID&from=2020-01-01&to=2020-01-31" | json '.length')" 0
 
 echo; echo "Account status"

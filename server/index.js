@@ -303,6 +303,25 @@ const server = http.createServer(async (request, response) => {
         // and flag it, so a gap in the data is visible instead of silently wrong.
         let finalSeconds = seconds
         let finalEstimated = Boolean(body.estimated)
+
+        // Talk time cannot exceed how long the line was actually busy. If it does, the phone
+        // matched the wrong call-log row -- dialling the same number twice in quick succession
+        // used to do this -- so clamp it and flag it rather than reporting a figure that the
+        // call could not possibly have produced.
+        const busyStart = at(body.offhookAtMs) || call.offhook_at
+        if (status === 'Answered' && busyStart) {
+          const endedAt = Number(body.endedAtMs) > 0 ? Number(body.endedAtMs) : Date.now()
+          const busySeconds = Math.max(0, Math.round((endedAt - new Date(busyStart).getTime()) / 1000))
+          // Only act on a busy span long enough to mean something. A near-zero span means the
+          // off-hook moment was never reported properly, and clamping against it would throw
+          // away a duration the phone measured correctly -- worse than the problem it guards.
+          if (busySeconds >= 5 && finalSeconds > busySeconds + 2) {
+            console.warn(`Call ${call.id}: reported ${finalSeconds}s of talk time but the line was busy for only ${busySeconds}s; clamping.`)
+            finalSeconds = busySeconds
+            finalEstimated = true
+          }
+        }
+
         if (status === 'Answered' && finalSeconds <= 0) {
           const busySince = at(body.offhookAtMs) || call.offhook_at
           finalSeconds = busySince
