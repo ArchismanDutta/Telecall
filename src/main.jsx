@@ -287,7 +287,10 @@ function CallsTable({ calls, callers, showCaller = true, limit, emptyText = 'No 
         <td><OutcomeBadge status={call.status} /></td>
         <td className="duration-cell">
           <strong className="table-date" title={call.estimated ? 'Estimated: the phone could not read its call log, so this includes ringing.' : 'Talk time, measured from the call log'}>{call.estimated ? `~${call.duration}` : call.duration}</strong>
-          <span className="table-sub">{call.ringSeconds !== null ? `rang ${call.ringSeconds}s` : call.estimated ? 'estimated' : ''}</span>
+          <span className="table-sub">{call.ringSeconds !== null
+            ? `rang ${call.ringSeconds}s`
+            : call.estimated ? 'estimated'
+            : call.status === 'Answered' && !call.seconds ? 'not recorded' : ''}</span>
         </td>
       </tr>
     }) : <tr><td colSpan={showCaller ? 5 : 4} className="empty-cell">{emptyText}</td></tr>}

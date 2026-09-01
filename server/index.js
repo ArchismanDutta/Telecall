@@ -17,6 +17,10 @@ const ACTIVE = ['Queued', 'Calling', 'In progress', 'Ending']
 const TERMINAL = ['Answered', 'Missed', 'Rejected', 'Failed']
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(value => value.trim()).filter(Boolean)
 
+// Bumped whenever the call-timing contract changes, so /api/health tells you what is running
+// without guessing from the UI. 'call-log-timing' means talk time excludes ringing.
+const BUILD = { version: 2, features: ['sessions', 'offhook-at', 'call-log-timing', 'estimate-flag'] }
+
 /* ---------- http helpers ---------- */
 
 const send = (response, status, payload, headers = {}) => {
@@ -203,7 +207,7 @@ const server = http.createServer(async (request, response) => {
   const reply = (status, payload, headers = {}) => send(response, status, payload, { ...cors, ...headers })
 
   if (method === 'GET' && !route.startsWith('/api/')) return serveApp(response, route)
-  if (route === '/api/health') return reply(200, { ok: true, driver })
+  if (route === '/api/health') return reply(200, { ok: true, driver, build: BUILD })
 
   try {
     const body = ['POST', 'PATCH', 'DELETE'].includes(method) ? await readBody(request) : {}
@@ -293,8 +297,20 @@ const server = http.createServer(async (request, response) => {
           [call.id, status, at(body.offhookAtMs)],
         )
       } else if (TERMINAL.includes(status)) {
-        // The phone reads the connected duration out of the call log, so `seconds` here is
-        // real talk time and answeredAtMs is the moment the other end actually picked up.
+        // "Answered" with no talk time is self-contradictory: the phone maps a zero-length
+        // connection to Missed, so reaching here means the report lost its duration on the
+        // way. Rather than show a confident 00:00, fall back to how long the line was busy
+        // and flag it, so a gap in the data is visible instead of silently wrong.
+        let finalSeconds = seconds
+        let finalEstimated = Boolean(body.estimated)
+        if (status === 'Answered' && finalSeconds <= 0) {
+          const busySince = at(body.offhookAtMs) || call.offhook_at
+          finalSeconds = busySince
+            ? Math.max(0, Math.round((Date.now() - new Date(busySince).getTime()) / 1000))
+            : 0
+          finalEstimated = true
+          console.warn(`Call ${call.id} reported Answered with no talk time; recorded ${finalSeconds}s as an estimate.`)
+        }
         await query(
           `UPDATE calls SET status = $2, duration = $3, duration_estimated = $4,
                   offhook_at  = COALESCE($5::timestamptz, offhook_at),
@@ -302,7 +318,7 @@ const server = http.createServer(async (request, response) => {
                   ended_at    = COALESCE($7::timestamptz, now()),
                   updated_at  = now()
             WHERE id = $1`,
-          [call.id, status, seconds, Boolean(body.estimated),
+          [call.id, status, finalSeconds, finalEstimated,
            at(body.offhookAtMs), at(body.answeredAtMs), at(body.endedAtMs)],
         )
       } else {
