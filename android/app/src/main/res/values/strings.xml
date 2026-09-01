@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Telecall Bridge</string>
+    <string name="bridge_channel_name">Telecall call bridge</string>
+</resources>
