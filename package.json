@@ -8,15 +8,17 @@
     "server": "node server/index.js",
     "start": "node server/index.js",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "./scripts/smoke-test.sh"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "latest",
-    "vite": "latest",
-    "react": "latest",
-    "react-dom": "latest"
+    "@electric-sql/pglite": "^0.3.10",
+    "@vitejs/plugin-react": "^6.1.1",
+    "pg": "^8.16.3",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "vite": "^8.2.2"
   },
-  "devDependencies": {},
   "engines": {
     "node": ">=20"
   }

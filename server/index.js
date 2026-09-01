@@ -1,75 +1,58 @@
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
-import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
+import crypto from 'node:crypto'
+import { query, one, newId, migrate, driver } from './db.js'
+import {
+  hashPassword, passwordMatches, sessionUser, createSession, destroySession,
+  sessionCookie, clearedCookie, readCookie, seedAdmin, SESSION_COOKIE,
+} from './auth.js'
 
 const root = path.dirname(fileURLToPath(import.meta.url))
-const dataDirectory = path.join(root, '..', '.data')
-const dataFile = path.join(dataDirectory, 'telecall.json')
 const distDirectory = path.join(root, '..', 'dist')
 const port = Number(process.env.PORT || 8787)
+const ACTIVE = ['Queued', 'Calling', 'In progress', 'Ending']
+const TERMINAL = ['Answered', 'Missed', 'Rejected', 'Failed']
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(value => value.trim()).filter(Boolean)
 
-const emptyState = () => ({ agents: {}, devices: {}, pairings: {}, calls: {}, commands: [] })
-let state = emptyState()
+/* ---------- http helpers ---------- */
 
-try {
-  state = JSON.parse(fs.readFileSync(dataFile, 'utf8'))
-} catch {
-  state = emptyState()
-}
-
-const persist = () => {
-  fs.mkdirSync(dataDirectory, { recursive: true })
-  fs.writeFileSync(dataFile, JSON.stringify(state, null, 2))
-}
-
-const id = prefix => `${prefix}-${crypto.randomUUID()}`
-const normalizeUsername = value => String(value || '').trim().toLowerCase()
-const hashPassword = (password, salt = crypto.randomBytes(16).toString('hex')) => {
-  const digest = crypto.scryptSync(String(password), salt, 64).toString('hex')
-  return `${salt}:${digest}`
-}
-const passwordMatches = (password, storedHash) => {
-  const [salt, expectedHex] = String(storedHash || '').split(':')
-  if (!salt || !expectedHex) return false
-  const actual = crypto.scryptSync(String(password), salt, 64)
-  const expected = Buffer.from(expectedHex, 'hex')
-  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected)
-}
-const send = (response, status, payload) => {
-  response.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-  })
+const send = (response, status, payload, headers = {}) => {
+  response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...headers })
   response.end(JSON.stringify(payload))
+  return true // callers rely on this being truthy to short-circuit their handler
+}
+
+const corsHeaders = request => {
+  const origin = request.headers.origin
+  if (!origin || !allowedOrigins.includes(origin)) return {}
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Credentials': 'true',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Methods': 'GET,POST,PATCH,DELETE,OPTIONS',
+    Vary: 'Origin',
+  }
 }
 
 const readBody = request => new Promise((resolve, reject) => {
   let value = ''
-  request.on('data', chunk => { value += chunk })
+  request.on('data', chunk => {
+    value += chunk
+    if (value.length > 100_000) reject(new Error('Request body is too large'))
+  })
   request.on('end', () => {
     try { resolve(value ? JSON.parse(value) : {}) } catch { reject(new Error('Invalid JSON')) }
   })
   request.on('error', reject)
 })
 
-const deviceForAgent = agent => agent?.deviceToken ? state.devices[agent.deviceToken] : null
-const isConnected = device => Boolean(device && Date.now() - device.lastSeen < 30_000)
-const publicAgent = agent => {
-  if (!agent) return null
-  const device = deviceForAgent(agent)
-  const { passwordHash, ...safeAgent } = agent
-  return {
-    ...safeAgent,
-    bridgeConnected: isConnected(device),
-    deviceName: device?.deviceName || '',
-    lastSeen: device ? 'Just now' : safeAgent.lastSeen || 'Never',
-  }
+const contentTypes = {
+  '.css': 'text/css; charset=utf-8', '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8',
+  '.png': 'image/png', '.svg': 'image/svg+xml', '.webmanifest': 'application/manifest+json',
 }
-const contentTypes = { '.css': 'text/css; charset=utf-8', '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8', '.png': 'image/png', '.svg': 'image/svg+xml', '.webmanifest': 'application/manifest+json' }
 
 const serveApp = (response, pathname) => {
   let requestedPath
@@ -80,211 +63,410 @@ const serveApp = (response, pathname) => {
   const filePath = path.extname(safeCandidate) ? safeCandidate : path.join(distDirectory, 'index.html')
   try {
     const data = fs.readFileSync(filePath)
-    response.writeHead(200, { 'Content-Type': contentTypes[path.extname(filePath)] || 'application/octet-stream', 'Cache-Control': path.basename(filePath) === 'index.html' ? 'no-cache' : 'public, max-age=31536000, immutable' })
+    response.writeHead(200, {
+      'Content-Type': contentTypes[path.extname(filePath)] || 'application/octet-stream',
+      'Cache-Control': path.basename(filePath) === 'index.html' ? 'no-cache' : 'public, max-age=31536000, immutable',
+    })
     response.end(data)
   } catch {
     send(response, 404, { error: 'App asset not found. Run npm run build first.' })
   }
 }
 
+/* ---------- shaping ---------- */
+
+const initialsOf = name => String(name).trim().split(/\s+/).map(part => part[0]).join('').slice(0, 2).toUpperCase()
+const COLORS = ['mint', 'blue', 'peach', 'lavender']
+const colorFor = id => COLORS[[...String(id)].reduce((sum, ch) => sum + ch.charCodeAt(0), 0) % COLORS.length]
+
+const relativeSeen = value => {
+  if (!value) return 'Never'
+  const seconds = Math.floor((Date.now() - new Date(value).getTime()) / 1000)
+  if (seconds < 60) return 'Just now'
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`
+  return `${Math.floor(seconds / 86400)}d ago`
+}
+
+const publicUser = row => row && ({
+  id: row.id,
+  name: row.name,
+  username: row.username,
+  role: row.role,
+  status: row.status,
+  createdAt: row.created_at,
+  initials: initialsOf(row.name),
+  color: colorFor(row.id),
+  bridgeConnected: Boolean(row.bridge_connected),
+  deviceName: row.device_name || '',
+  platform: row.platform || '',
+  lastSeen: relativeSeen(row.last_seen),
+  presence: row.bridge_connected ? (row.on_call ? 'In a call' : 'Online') : 'Offline',
+  callsToday: Number(row.calls_today || 0),
+  talkTodaySeconds: Number(row.talk_today || 0),
+})
+
+const publicCall = row => row && ({
+  id: row.id,
+  callerId: row.user_id,
+  number: row.phone_number,
+  status: row.status,
+  seconds: Number(row.duration || 0),
+  startedAt: row.started_at,
+  answeredAt: row.answered_at,
+  endedAt: row.ended_at,
+  createdAt: row.created_at,
+})
+
+const TELECALLER_COLUMNS = `
+  SELECT u.id, u.name, u.username, u.role, u.status, u.created_at,
+         d.device_name, d.platform, d.last_seen,
+         (d.last_seen > now() - interval '30 seconds') AS bridge_connected,
+         COALESCE(t.calls_today, 0) AS calls_today,
+         COALESCE(t.talk_today, 0)  AS talk_today,
+         EXISTS (SELECT 1 FROM calls c WHERE c.user_id = u.id AND c.status = ANY($1)) AS on_call
+    FROM users u
+    LEFT JOIN devices d ON d.user_id = u.id
+    LEFT JOIN LATERAL (
+      SELECT count(*) AS calls_today, COALESCE(sum(duration), 0) AS talk_today
+        FROM calls c
+       WHERE c.user_id = u.id AND c.created_at >= date_trunc('day', now())
+    ) t ON true`
+
+const listTelecallers = () =>
+  query(`${TELECALLER_COLUMNS} WHERE u.role = 'telecaller' ORDER BY u.created_at`, [ACTIVE])
+
+const getTelecaller = userId =>
+  one(`${TELECALLER_COLUMNS} WHERE u.id = $2`, [ACTIVE, userId])
+
+/* ---------- call-state reconciliation ---------- */
+
+// The phone reports the radio's own call state on every poll. The bridge also posts explicit
+// transitions, but those can be missed -- a killed process, a dropped request, a callback the
+// OS never delivered. This is the safety net that stops a call being stuck on "Calling"
+// forever. The bridge's own report always wins: anything updated in the last few seconds is
+// left alone so a precise call-log duration is never overwritten by an estimate.
+const reconcileCallState = async (device, callState) => {
+  if (!['IDLE', 'OFFHOOK', 'RINGING'].includes(callState || '')) return
+  const call = await one(
+    `SELECT * FROM calls WHERE user_id = $1 AND status = ANY($2) ORDER BY created_at DESC LIMIT 1`,
+    [device.user_id, ACTIVE],
+  )
+  if (!call) return
+
+  if (callState === 'OFFHOOK') {
+    if (['Queued', 'Calling'].includes(call.status)) {
+      await query(
+        `UPDATE calls SET status = 'In progress', answered_at = COALESCE(answered_at, now()), updated_at = now() WHERE id = $1`,
+        [call.id],
+      )
+    }
+    return
+  }
+
+  if (callState !== 'IDLE') return
+  const settled = Date.now() - new Date(call.updated_at).getTime() > 6000
+  if (!settled) return
+
+  if (call.answered_at) {
+    await query(
+      `UPDATE calls SET status = 'Answered', ended_at = now(), updated_at = now(),
+              duration = GREATEST(0, EXTRACT(EPOCH FROM (now() - answered_at))::int)
+        WHERE id = $1`,
+      [call.id],
+    )
+  } else if (Date.now() - new Date(call.started_at).getTime() > 25_000) {
+    // The phone never went off-hook: the dialler was cancelled, or the call never placed.
+    await query(`UPDATE calls SET status = 'Failed', ended_at = now(), updated_at = now() WHERE id = $1`, [call.id])
+  }
+}
+
+/* ---------- routing ---------- */
+
 const server = http.createServer(async (request, response) => {
-  if (request.method === 'OPTIONS') return send(response, 204, {})
+  const cors = corsHeaders(request)
+  if (request.method === 'OPTIONS') return send(response, 204, {}, cors)
+
   const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`)
   const route = url.pathname
+  const method = request.method
+  const reply = (status, payload, headers = {}) => send(response, status, payload, { ...cors, ...headers })
 
-  if (request.method === 'GET' && !route.startsWith('/api/')) return serveApp(response, route)
-
-  if (route === '/api/health' && request.method === 'GET') return send(response, 200, { ok: true })
+  if (method === 'GET' && !route.startsWith('/api/')) return serveApp(response, route)
+  if (route === '/api/health') return reply(200, { ok: true, driver })
 
   try {
-    if (route === '/api/agents' && request.method === 'GET') {
-      return send(response, 200, Object.values(state.agents).map(publicAgent))
-    }
+    const body = ['POST', 'PATCH', 'DELETE'].includes(method) ? await readBody(request) : {}
+    const match = pattern => route.match(pattern)
 
-    if (route === '/api/agents' && request.method === 'POST') {
-      const body = await readBody(request)
-      const username = normalizeUsername(body.username)
-      if (!body.name || !username || !body.password) return send(response, 400, { error: 'name, username and password are required' })
-      if (Object.values(state.agents).some(agent => normalizeUsername(agent.username) === username)) return send(response, 409, { error: 'That username is already in use' })
-      const agentId = body.id || body.agentId || id('agent')
-      const names = String(body.name).trim().split(/\s+/)
-      const initials = names.map(name => name[0]).join('').slice(0, 2).toUpperCase()
-      const agent = {
-        id: agentId,
-        name: String(body.name).trim(),
-        username,
-        passwordHash: hashPassword(body.password),
-        status: body.status || 'Active',
-        presence: 'Offline',
-        initials,
-        callsToday: 0,
-        talkTime: '0s',
-        connected: null,
-        lastSeen: 'Never',
-        bridgeConnected: false,
-        color: body.color || 'mint',
-        updatedAt: Date.now(),
+    /* ----- authentication ----- */
+
+    if (route === '/api/auth/login' && method === 'POST') {
+      const username = String(body.username || '').trim().toLowerCase()
+      const user = await one('SELECT * FROM users WHERE lower(username) = $1', [username])
+      if (!user || !passwordMatches(body.password, user.password_hash)) {
+        return reply(401, { error: 'Incorrect username or password' })
       }
-      state.agents[agentId] = agent
-      persist()
-      return send(response, 201, publicAgent(agent))
+      if (user.status !== 'Active') return reply(403, { error: 'This account is not active. Contact the administrator.' })
+      const token = await createSession(user.id)
+      const shaped = user.role === 'telecaller' ? publicUser(await getTelecaller(user.id)) : publicUser(user)
+      return reply(200, shaped, { 'Set-Cookie': sessionCookie(token) })
     }
 
-    if (route === '/api/agents/login' && request.method === 'POST') {
-      const body = await readBody(request)
-      const username = normalizeUsername(body.username)
-      const agent = Object.values(state.agents).find(item => normalizeUsername(item.username) === username)
-      if (!agent) return send(response, 404, { error: 'No agent account matches that username' })
-      if (agent.status !== 'Active') return send(response, 403, { error: 'This agent account is not active' })
-      if (!agent.passwordHash) {
-        // Accounts created by the first prototype did not store a password.
-        // Treat the first successful login as a one-time password migration.
-        if (!body.password) return send(response, 401, { error: 'A password is required' })
-        agent.passwordHash = hashPassword(body.password)
-        persist()
-        return send(response, 200, publicAgent(agent))
-      }
-      if (!passwordMatches(body.password, agent.passwordHash)) return send(response, 401, { error: 'Incorrect username or password' })
-      return send(response, 200, publicAgent(agent))
+    if (route === '/api/auth/logout' && method === 'POST') {
+      const token = readCookie(request, SESSION_COOKIE)
+      if (token) await destroySession(token)
+      return reply(200, { ok: true }, { 'Set-Cookie': clearedCookie() })
     }
 
-    if (route === '/api/agents/sync' && request.method === 'POST') {
-      const body = await readBody(request)
-      if (!body.agentId || !body.username) return send(response, 400, { error: 'agentId and username are required' })
-      const existing = state.agents[body.agentId] || {}
-      state.agents[body.agentId] = {
-        ...existing,
-        id: body.agentId,
-        username: normalizeUsername(body.username),
-        name: body.name || existing.name || body.username,
-        status: body.status || existing.status || 'Active',
-        ...(body.password && !existing.passwordHash ? { passwordHash: hashPassword(body.password) } : {}),
-        updatedAt: Date.now(),
-      }
-      persist()
-      return send(response, 200, { ok: true, agent: publicAgent(state.agents[body.agentId]) })
-    }
+    /* ----- device endpoints: authenticated by pairing code or device token ----- */
 
-    if (route === '/api/pairing/start' && request.method === 'POST') {
-      const body = await readBody(request)
-      if (!state.agents[body.agentId]) return send(response, 404, { error: 'Agent account is not synced' })
-      const code = String(Math.floor(100000 + Math.random() * 900000))
-      state.pairings[code] = { agentId: body.agentId, expiresAt: Date.now() + 10 * 60_000 }
-      persist()
-      return send(response, 200, { code, expiresAt: state.pairings[code].expiresAt })
-    }
-
-    if (route === '/api/pairing/complete' && request.method === 'POST') {
-      const body = await readBody(request)
-      const pairing = state.pairings[String(body.code || '')]
-      if (!pairing || pairing.expiresAt < Date.now()) return send(response, 400, { error: 'Pairing code is invalid or expired' })
-      if (!body.deviceId) return send(response, 400, { error: 'deviceId is required' })
+    if (route === '/api/pairing/complete' && method === 'POST') {
+      const pairing = await one('SELECT * FROM pairings WHERE code = $1 AND expires_at > now()', [String(body.code || '')])
+      if (!pairing) return reply(400, { error: 'Pairing code is invalid or expired' })
+      if (!body.deviceId) return reply(400, { error: 'deviceId is required' })
       const token = crypto.randomBytes(32).toString('hex')
-      const device = { token, agentId: pairing.agentId, deviceId: body.deviceId, deviceName: body.deviceName || 'Android phone', lastSeen: Date.now() }
-      state.devices[token] = device
-      const agent = state.agents[pairing.agentId]
-      if (agent.deviceToken && state.devices[agent.deviceToken]) delete state.devices[agent.deviceToken]
-      agent.deviceToken = token
-      delete state.pairings[String(body.code)]
-      persist()
-      return send(response, 200, { token, agentId: pairing.agentId, deviceName: device.deviceName })
+      await query('DELETE FROM devices WHERE user_id = $1', [pairing.user_id])
+      await query(
+        `INSERT INTO devices (id, user_id, device_id, device_name, platform, token, status, last_seen)
+         VALUES ($1, $2, $3, $4, $5, $6, 'Online', now())`,
+        [newId(), pairing.user_id, String(body.deviceId), body.deviceName || 'Android phone', body.platform || 'android', token],
+      )
+      await query('DELETE FROM pairings WHERE code = $1', [String(body.code)])
+      return reply(200, { token, deviceName: body.deviceName || 'Android phone' })
     }
 
-    const deviceMatch = route.match(/^\/api\/agents\/([^/]+)\/device$/)
-    if (deviceMatch && request.method === 'GET') {
-      const agent = state.agents[deviceMatch[1]]
-      const device = deviceForAgent(agent)
-      return send(response, 200, { connected: isConnected(device), deviceName: device?.deviceName || '', lastSeen: device?.lastSeen || null })
+    const deviceFor = async token => token ? one('SELECT * FROM devices WHERE token = $1', [String(token)]) : null
+
+    if (route === '/api/devices/heartbeat' && method === 'POST') {
+      const device = await deviceFor(body.token)
+      if (!device) return reply(401, { error: 'Unknown device token' })
+      await query("UPDATE devices SET last_seen = now(), status = 'Online' WHERE id = $1", [device.id])
+      return reply(200, { ok: true })
     }
 
-    if (route === '/api/devices/heartbeat' && request.method === 'POST') {
-      const body = await readBody(request)
-      const device = state.devices[body.token]
-      if (!device) return send(response, 401, { error: 'Unknown device token' })
-      device.lastSeen = Date.now()
-      persist()
-      return send(response, 200, { ok: true })
-    }
-
-    if (route === '/api/devices/commands' && request.method === 'GET') {
-      const token = url.searchParams.get('token')
-      const device = state.devices[token]
-      if (!device) return send(response, 401, { error: 'Unknown device token' })
-      device.lastSeen = Date.now()
-      const command = state.commands.find(item => {
-        if (item.token !== token || item.deliveredAt) return false
-        const status = state.calls[item.callId]?.status
-        return item.type === 'PLACE_CALL' ? status === 'Queued' : item.type === 'END_CALL' && ['Calling', 'In progress', 'Ending'].includes(status)
+    if (route === '/api/devices/commands' && method === 'GET') {
+      const device = await deviceFor(url.searchParams.get('token'))
+      if (!device) return reply(401, { error: 'Unknown device token' })
+      await query("UPDATE devices SET last_seen = now(), status = 'Online' WHERE id = $1", [device.id])
+      await reconcileCallState(device, url.searchParams.get('callState'))
+      const command = await one(
+        `SELECT cmd.* FROM commands cmd JOIN calls c ON c.id = cmd.call_id
+          WHERE cmd.device_token = $1 AND cmd.delivered_at IS NULL
+            AND ((cmd.type = 'PLACE_CALL' AND c.status = 'Queued')
+              OR (cmd.type = 'END_CALL'   AND c.status = ANY($2)))
+          ORDER BY cmd.created_at LIMIT 1`,
+        [device.token, ['Calling', 'In progress', 'Ending']],
+      )
+      if (command) await query('UPDATE commands SET delivered_at = now() WHERE id = $1', [command.id])
+      return reply(200, {
+        command: command ? { id: command.id, type: command.type, callId: command.call_id, number: command.number } : null,
       })
-      if (command) command.deliveredAt = Date.now()
-      persist()
-      return send(response, 200, { command: command ? { id: command.id, type: command.type, callId: command.callId, number: command.number } : null })
     }
 
-    if (route === '/api/calls/dispatch' && request.method === 'POST') {
-      const body = await readBody(request)
-      const agent = state.agents[body.agentId]
-      const device = deviceForAgent(agent)
-      if (!agent) return send(response, 404, { error: 'Agent account not found' })
-      if (!isConnected(device)) return send(response, 409, { error: 'Android device is not connected' })
-      const now = new Date()
-      const call = { id: id('call'), callerId: body.agentId, number: body.number, status: 'Queued', seconds: 0, date: now.toISOString().slice(0, 10), time: now.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }), createdAt: now.toISOString() }
-      state.calls[call.id] = call
-      state.commands.push({ id: id('command'), token: device.token, type: 'PLACE_CALL', callId: call.id, number: body.number, deliveredAt: null })
-      persist()
-      return send(response, 200, { callId: call.id })
-    }
-
-    const hangupMatch = route.match(/^\/api\/calls\/([^/]+)\/hangup$/)
-    if (hangupMatch && request.method === 'POST') {
-      const body = await readBody(request)
-      const call = state.calls[hangupMatch[1]]
-      if (!call) return send(response, 404, { error: 'Call not found' })
-      const device = deviceForAgent(state.agents[call.callerId])
-      if (!isConnected(device)) return send(response, 409, { error: 'Android device is not connected' })
-      if (body.status === 'Failed') call.pendingStatus = 'Failed'
-      if (call.status === 'Queued') {
-        call.status = body.status === 'Failed' ? 'Failed' : 'Rejected'
-      } else if (!['Answered', 'Missed', 'Rejected', 'Failed'].includes(call.status)) {
-        call.status = 'Ending'
-        const alreadyQueued = state.commands.some(item => item.callId === call.id && item.type === 'END_CALL' && !item.deliveredAt)
-        if (!alreadyQueued) state.commands.push({ id: id('command'), token: device.token, type: 'END_CALL', callId: call.id, number: call.number, deliveredAt: null })
+    const statusMatch = match(/^\/api\/calls\/([^/]+)\/status$/)
+    if (statusMatch && method === 'POST') {
+      const device = await deviceFor(body.token)
+      if (!device) return reply(401, { error: 'Unknown device token' })
+      const call = await one('SELECT * FROM calls WHERE id = $1 AND user_id = $2', [statusMatch[1], device.user_id])
+      if (!call) return reply(404, { error: 'Call not found for this device' })
+      const status = String(body.status || '')
+      if (![...ACTIVE, ...TERMINAL].includes(status)) return reply(400, { error: 'Unrecognised call status' })
+      const seconds = Math.max(0, Number(body.seconds) || 0)
+      if (status === 'In progress') {
+        await query("UPDATE calls SET status = $2, answered_at = COALESCE(answered_at, now()), updated_at = now() WHERE id = $1", [call.id, status])
+      } else if (TERMINAL.includes(status)) {
+        await query('UPDATE calls SET status = $2, duration = $3, ended_at = now(), updated_at = now() WHERE id = $1', [call.id, status, seconds])
+      } else {
+        await query('UPDATE calls SET status = $2, updated_at = now() WHERE id = $1', [call.id, status])
       }
-      call.updatedAt = new Date().toISOString()
-      persist()
-      return send(response, 200, { ok: true, call })
+      return reply(200, publicCall(await one('SELECT * FROM calls WHERE id = $1', [call.id])))
     }
 
-    const callStatusMatch = route.match(/^\/api\/calls\/([^/]+)\/status$/)
-    if (callStatusMatch && request.method === 'POST') {
-      const body = await readBody(request)
-      const call = state.calls[callStatusMatch[1]]
-      if (!call) return send(response, 404, { error: 'Call not found' })
-      call.status = call.pendingStatus || body.status || call.status
-      call.seconds = Number(body.seconds) || 0
-      call.updatedAt = new Date().toISOString()
-      if (['Answered', 'Missed', 'Rejected', 'Failed'].includes(call.status)) delete call.pendingStatus
-      persist()
-      return send(response, 200, { ok: true, call })
+    /* ----- everything below requires a signed-in user ----- */
+
+    const user = await sessionUser(request)
+    if (route === '/api/auth/me' && method === 'GET') {
+      if (!user) return reply(401, { error: 'Not signed in' })
+      const shaped = user.role === 'telecaller' ? publicUser(await getTelecaller(user.id)) : publicUser(user)
+      return reply(200, shaped)
+    }
+    if (!user) return reply(401, { error: 'Sign in to continue' })
+    const isAdmin = user.role === 'admin'
+    const denyUnlessAdmin = () => isAdmin ? null : reply(403, { error: 'Administrator access is required' })
+
+    /* ----- telecaller accounts (admin only) ----- */
+
+    if (route === '/api/telecallers' && method === 'GET') {
+      if (denyUnlessAdmin()) return
+      return reply(200, (await listTelecallers()).map(publicUser))
     }
 
-    const callMatch = route.match(/^\/api\/calls\/([^/]+)$/)
-    if (callMatch && request.method === 'GET') {
-      const call = state.calls[callMatch[1]]
-      return call ? send(response, 200, call) : send(response, 404, { error: 'Call not found' })
+    if (route === '/api/telecallers' && method === 'POST') {
+      if (denyUnlessAdmin()) return
+      const username = String(body.username || '').trim().toLowerCase()
+      const name = String(body.name || '').trim()
+      if (!name || !username || !body.password) return reply(400, { error: 'Name, username and password are all required' })
+      if (String(body.password).length < 6) return reply(400, { error: 'Password must be at least 6 characters' })
+      if (await one('SELECT id FROM users WHERE lower(username) = $1', [username])) {
+        return reply(409, { error: 'That username is already in use' })
+      }
+      const id = newId()
+      await query(
+        `INSERT INTO users (id, name, username, password_hash, role, status)
+         VALUES ($1, $2, $3, $4, 'telecaller', $5)`,
+        [id, name, username, hashPassword(body.password), body.status === 'Paused' ? 'Paused' : 'Active'],
+      )
+      return reply(201, publicUser(await getTelecaller(id)))
     }
 
-    if (route === '/api/calls' && request.method === 'GET') {
-      const agentId = url.searchParams.get('agentId')
-      return send(response, 200, Object.values(state.calls).filter(call => !agentId || call.callerId === agentId))
+    const telecallerMatch = match(/^\/api\/telecallers\/([^/]+)$/)
+    if (telecallerMatch && (method === 'PATCH' || method === 'DELETE')) {
+      if (denyUnlessAdmin()) return
+      const target = await one("SELECT * FROM users WHERE id = $1 AND role = 'telecaller'", [telecallerMatch[1]])
+      if (!target) return reply(404, { error: 'Telecaller not found' })
+      if (method === 'DELETE') {
+        await query('DELETE FROM users WHERE id = $1', [target.id])
+        return reply(200, { ok: true })
+      }
+      const name = body.name === undefined ? target.name : String(body.name).trim()
+      const username = body.username === undefined ? target.username : String(body.username).trim().toLowerCase()
+      const status = body.status === undefined ? target.status : (body.status === 'Paused' ? 'Paused' : 'Active')
+      if (!name || !username) return reply(400, { error: 'Name and username cannot be empty' })
+      const clash = await one('SELECT id FROM users WHERE lower(username) = $1 AND id <> $2', [username, target.id])
+      if (clash) return reply(409, { error: 'That username is already in use' })
+      await query('UPDATE users SET name = $2, username = $3, status = $4 WHERE id = $1', [target.id, name, username, status])
+      if (status !== 'Active') await query('DELETE FROM sessions WHERE user_id = $1', [target.id])
+      return reply(200, publicUser(await getTelecaller(target.id)))
     }
 
-    return send(response, 404, { error: 'Not found' })
+    const passwordMatch = match(/^\/api\/telecallers\/([^/]+)\/password$/)
+    if (passwordMatch && method === 'POST') {
+      if (denyUnlessAdmin()) return
+      if (!body.password || String(body.password).length < 6) return reply(400, { error: 'Password must be at least 6 characters' })
+      const target = await one("SELECT id FROM users WHERE id = $1 AND role = 'telecaller'", [passwordMatch[1]])
+      if (!target) return reply(404, { error: 'Telecaller not found' })
+      await query('UPDATE users SET password_hash = $2 WHERE id = $1', [target.id, hashPassword(body.password)])
+      await query('DELETE FROM sessions WHERE user_id = $1', [target.id])
+      return reply(200, { ok: true })
+    }
+
+    const pairingMatch = match(/^\/api\/telecallers\/([^/]+)\/pairing$/)
+    if (pairingMatch && method === 'POST') {
+      if (denyUnlessAdmin()) return
+      const target = await one("SELECT id FROM users WHERE id = $1 AND role = 'telecaller'", [pairingMatch[1]])
+      if (!target) return reply(404, { error: 'Telecaller not found' })
+      const code = String(crypto.randomInt(100000, 1000000))
+      await query('DELETE FROM pairings WHERE user_id = $1 OR expires_at < now()', [target.id])
+      await query("INSERT INTO pairings (code, user_id, expires_at) VALUES ($1, $2, now() + interval '10 minutes')", [code, target.id])
+      return reply(200, { code, expiresAt: Date.now() + 10 * 60_000 })
+    }
+
+    const deviceMatch = match(/^\/api\/telecallers\/([^/]+)\/device$/)
+    if (deviceMatch && (method === 'GET' || method === 'DELETE')) {
+      if (!isAdmin && user.id !== deviceMatch[1]) return reply(403, { error: 'You can only view your own device' })
+      if (method === 'DELETE') {
+        if (denyUnlessAdmin()) return
+        await query('DELETE FROM devices WHERE user_id = $1', [deviceMatch[1]])
+        return reply(200, { ok: true })
+      }
+      const device = await one('SELECT * FROM devices WHERE user_id = $1', [deviceMatch[1]])
+      const connected = Boolean(device && Date.now() - new Date(device.last_seen).getTime() < 30_000)
+      return reply(200, {
+        connected,
+        deviceName: device?.device_name || '',
+        platform: device?.platform || '',
+        lastSeen: relativeSeen(device?.last_seen),
+      })
+    }
+
+    /* ----- calls ----- */
+
+    if (route === '/api/calls' && method === 'GET') {
+      const requested = url.searchParams.get('userId')
+      const scopeId = isAdmin ? requested : user.id
+      const from = url.searchParams.get('from')
+      const to = url.searchParams.get('to')
+      const clauses = []
+      const params = []
+      if (scopeId) { params.push(scopeId); clauses.push(`user_id = $${params.length}`) }
+      if (from) { params.push(from); clauses.push(`created_at >= $${params.length}::date`) }
+      if (to) { params.push(to); clauses.push(`created_at < ($${params.length}::date + interval '1 day')`) }
+      const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
+      const rows = await query(`SELECT * FROM calls ${where} ORDER BY created_at DESC LIMIT 2000`, params)
+      return reply(200, rows.map(publicCall))
+    }
+
+    if (route === '/api/calls/dispatch' && method === 'POST') {
+      if (isAdmin) return reply(403, { error: 'Administrators do not place calls' })
+      const digits = String(body.number || '').replace(/[^0-9+]/g, '')
+      if (digits.replace(/\D/g, '').length < 7) return reply(400, { error: 'Enter a valid phone number' })
+      const device = await one('SELECT * FROM devices WHERE user_id = $1', [user.id])
+      if (!device || Date.now() - new Date(device.last_seen).getTime() > 30_000) {
+        return reply(409, { error: 'Your Android phone is not connected. Ask the administrator to pair it.' })
+      }
+      const inFlight = await one('SELECT id FROM calls WHERE user_id = $1 AND status = ANY($2)', [user.id, ACTIVE])
+      if (inFlight) return reply(409, { error: 'Finish the call in progress before starting another' })
+      const callId = newId()
+      await query(
+        `INSERT INTO calls (id, user_id, phone_number, status, started_at) VALUES ($1, $2, $3, 'Queued', now())`,
+        [callId, user.id, digits],
+      )
+      await query(
+        `INSERT INTO commands (id, device_token, type, call_id, number) VALUES ($1, $2, 'PLACE_CALL', $3, $4)`,
+        [newId(), device.token, callId, digits],
+      )
+      return reply(200, { callId })
+    }
+
+    const callMatch = match(/^\/api\/calls\/([^/]+)$/)
+    if (callMatch && method === 'GET') {
+      const call = await one('SELECT * FROM calls WHERE id = $1', [callMatch[1]])
+      if (!call) return reply(404, { error: 'Call not found' })
+      if (!isAdmin && call.user_id !== user.id) return reply(403, { error: 'That call belongs to another telecaller' })
+      return reply(200, publicCall(call))
+    }
+
+    const hangupMatch = match(/^\/api\/calls\/([^/]+)\/hangup$/)
+    if (hangupMatch && method === 'POST') {
+      const call = await one('SELECT * FROM calls WHERE id = $1', [hangupMatch[1]])
+      if (!call) return reply(404, { error: 'Call not found' })
+      if (!isAdmin && call.user_id !== user.id) return reply(403, { error: 'That call belongs to another telecaller' })
+      if (TERMINAL.includes(call.status)) return reply(200, publicCall(call))
+      if (call.status === 'Queued') {
+        // The phone never picked the command up, so nothing needs to be hung up.
+        await query('UPDATE calls SET status = $2, ended_at = now(), updated_at = now() WHERE id = $1', [call.id, 'Failed'])
+        return reply(200, publicCall(await one('SELECT * FROM calls WHERE id = $1', [call.id])))
+      }
+      const device = await one('SELECT * FROM devices WHERE user_id = $1', [call.user_id])
+      if (!device) return reply(409, { error: 'The Android phone is no longer paired' })
+      await query("UPDATE calls SET status = 'Ending', updated_at = now() WHERE id = $1", [call.id])
+      const queued = await one("SELECT id FROM commands WHERE call_id = $1 AND type = 'END_CALL' AND delivered_at IS NULL", [call.id])
+      if (!queued) {
+        await query(
+          `INSERT INTO commands (id, device_token, type, call_id, number) VALUES ($1, $2, 'END_CALL', $3, $4)`,
+          [newId(), device.token, call.id, call.phone_number],
+        )
+      }
+      return reply(200, publicCall(await one('SELECT * FROM calls WHERE id = $1', [call.id])))
+    }
+
+    return reply(404, { error: 'Not found' })
   } catch (error) {
-    return send(response, 500, { error: error.message || 'Server error' })
+    console.error(`${method} ${route} failed:`, error.message)
+    return send(response, 500, { error: 'Something went wrong on the server' }, cors)
   }
 })
 
+await migrate()
+const seeded = await seedAdmin()
+
 server.listen(port, '0.0.0.0', () => {
-  console.log(`Telecall API listening on http://localhost:${port}`)
+  console.log(`Telecall API listening on http://localhost:${port} (storage: ${driver})`)
+  if (seeded?.generated) {
+    console.log(`\n  Admin account created\n    username: ${seeded.username}\n    password: ${seeded.password}\n`)
+    console.log('  Save this password now — it is not shown again. Set ADMIN_PASSWORD to choose your own.\n')
+  } else if (seeded) {
+    console.log(`\n  Admin account created with username "${seeded.username}" and your ADMIN_PASSWORD.\n`)
+  }
 })

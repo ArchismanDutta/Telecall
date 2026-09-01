@@ -1,11 +1,33 @@
+databases:
+  - name: telecall-db
+    plan: free
+    databaseName: telecall
+    user: telecall
+
 services:
   - type: web
     name: telecall
     runtime: node
     plan: free
-    buildCommand: npm install && npm run build
+    buildCommand: npm ci && npm run build
     startCommand: npm start
     healthCheckPath: /api/health
     envVars:
       - key: NODE_VERSION
         value: 22
+      - key: NODE_ENV
+        value: production
+      # Supplied by the managed Postgres above. Without it the server falls back to an
+      # embedded development database, which does not survive a redeploy.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: telecall-db
+          property: connectionString
+      # Prompted for on first deploy and never stored in the repository.
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      # Only needed if the browser app is ever served from a different origin to the API.
+      - key: ALLOWED_ORIGINS
+        sync: false

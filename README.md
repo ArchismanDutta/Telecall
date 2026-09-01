@@ -1,62 +1,125 @@
 # Telecall
 
-Telecall is a small browser-based call operations workspace for one administrator and multiple agents.
+A small browser-based calling workspace: one administrator manages telecaller accounts and
+reviews their performance, and each telecaller places calls through the physical SIM in a
+paired Android phone.
 
-## Run locally
+## What it does
+
+**Administrator** — signs in, creates telecaller accounts, activates or pauses them, resets
+passwords, pairs and unpairs Android phones, and reviews any telecaller's performance over a
+date range with KPIs, a calls-per-day chart and an outcome breakdown. Every call from every
+telecaller is visible, searchable and exportable to CSV.
+
+**Telecaller** — signs in, dials a number, and watches the call progress live while the paired
+phone places it over its SIM. Sees their own call history and today's totals, and nobody
+else's.
+
+## Running it locally
 
 ```bash
 npm install
-npm run server
+npm run server     # API + database on :8787
+npm run dev        # the app, in a second terminal
 ```
 
-In a second terminal, start the PWA:
+Open the address Vite prints. Sign in at `/admin/login` with the administrator account the
+server creates on first boot — it prints the username and a generated password to the console:
+
+```
+  Admin account created
+    username: admin
+    password: xTn3k9QpL
+```
+
+That password is shown once. Set `ADMIN_USERNAME` and `ADMIN_PASSWORD` before the first run to
+choose your own instead.
+
+With no `DATABASE_URL` the server runs an embedded Postgres (PGlite) that stores its data in
+`.data/`. It is meant for development only: it is not crash-safe, and a hard kill can force it
+to reset itself. Set `DATABASE_URL` to use a real Postgres locally.
+
+### Checking everything still works
 
 ```bash
-npm run dev
+npm test
 ```
 
-Open the local Vite URL in a browser. The default route opens the admin overview.
+This boots a throwaway server and database and runs 36 checks across authentication, account
+management, device pairing, the call lifecycle and role-based visibility.
 
-The Android phone must reach the API server over the local network. In the Android Bridge app, enter the computer's LAN address, for example `http://192.168.1.20:8787`, rather than `localhost`. Use HTTPS when the app is deployed.
+## Deploying
 
-## Render deployment
+The included [`render.yaml`](./render.yaml) provisions one Node web service and one managed
+Postgres database, and serves the app and the API from the same HTTPS origin.
 
-The included [`render.yaml`](/Users/archismandutta/Desktop/Telecall/render.yaml) is configured as one Node web service. It builds the PWA, serves the PWA and API from the same HTTPS URL, and exposes `/api/health` for health checks.
+1. Push this repository to GitHub.
+2. In Render, choose **New → Blueprint** and select the repository.
+3. Render prompts for `ADMIN_USERNAME` and `ADMIN_PASSWORD`. Set both — otherwise the
+   generated password appears only in the deploy log.
+4. Open the `onrender.com` URL. `/api/health` reports `{"ok":true,"driver":"postgres"}` when
+   the database is wired up correctly.
+5. Enter that HTTPS URL in the Android Bridge app before pairing a phone.
 
-1. Push this repository to a GitHub repository.
-2. In Render, choose **New → Blueprint** and select the repository, or choose **New → Web Service** and use the build command `npm install && npm run build` and start command `npm start`.
-3. Wait for the service to deploy, then open its `onrender.com` URL. The PWA and `/api/health` should both load from that URL.
-4. Enter that HTTPS URL in the Android Bridge app before pairing a phone.
+A free Render Postgres instance expires after a limited period; a free Neon database works the
+same way — set `DATABASE_URL` yourself and drop the `databases:` block.
 
-The current JSON file storage is suitable for an initial hosted test only. Use a persistent database before production; a free Render service can sleep and its local filesystem is not durable across redeploys.
+### Environment variables
+
+| Variable | Purpose |
+| --- | --- |
+| `DATABASE_URL` | Postgres connection string. Falls back to the embedded development database when unset. |
+| `ADMIN_USERNAME` | Administrator username, created on first boot. Defaults to `admin`. |
+| `ADMIN_PASSWORD` | Administrator password. A random one is generated and logged if unset. |
+| `ALLOWED_ORIGINS` | Comma-separated origins allowed to call the API cross-origin. Not needed when the app and API share an origin. |
+| `PORT` | Defaults to `8787`. |
+
+## Placing calls through a physical SIM
+
+The browser cannot reach a SIM. The Android companion in [`android/`](./android) receives call
+requests, dials them through the phone, and reports state back to the API.
+
+```
+browser  →  API  →  Android Bridge  →  SIM  →  customer
+```
+
+1. Create a telecaller account, then choose **Pair device** on the Agents page.
+2. Open the Android project in Android Studio, install it on the company phone, and grant the
+   phone permissions.
+3. Enter the server URL and the six-digit code in Telecall Bridge, then tap **Pair this phone**.
+   The code is single-use and expires after ten minutes.
+4. Once the phone reports in, the telecaller can dial from the calling screen.
+
+An installable debug APK is at
+[`android/app/build/outputs/apk/debug/TelecallBridge-debug.apk`](./android/app/build/outputs/apk/debug/TelecallBridge-debug.apk).
 
 ## Routes
 
-- `/admin/login` — admin sign in
-- `/admin/dashboard` — admin overview
-- `/admin/telecallers` — manage agent accounts
-- `/admin/telecallers/new` — create an agent account
-- `/admin/telecallers/:id/performance` — performance charts and KPIs
-- `/login` — agent sign in
-- `/caller` — calling screen
-- `/caller/history` — personal call history
+| Administrator | Telecaller |
+| --- | --- |
+| `/admin/login` | `/login` |
+| `/admin/dashboard` | `/caller` |
+| `/admin/telecallers` | `/caller/history` |
+| `/admin/telecallers/new` | |
+| `/admin/telecallers/:id/performance` | |
+| `/admin/call-history` | |
 
-## Physical SIM calling
+## How it is put together
 
-The PWA does not access the SIM directly. The Android Bridge companion in [`android/`](/Users/archismandutta/Desktop/Telecall/android) receives call requests, places calls through the phone's SIM, and reports call state back to the API.
+- `src/main.jsx` — the whole browser app: React, no router library, no chart library.
+- `server/index.js` — the HTTP API on `node:http`, no framework.
+- `server/db.js` — Postgres via `pg`, or embedded PGlite when there is no `DATABASE_URL`.
+- `server/auth.js` — scrypt password hashing and server-side sessions.
+- `server/schema.sql` — `users`, `devices`, `calls`, `sessions`, `pairings`, `commands`.
+- `android/` — the Android bridge that owns the SIM.
 
-1. Start `npm run server` and `npm run dev`.
-2. Create an agent account in the PWA.
-3. On the Agents page, choose `Pair device` and keep the six-digit code visible.
-4. Open the Android project in Android Studio, install it on the company phone, and grant phone permissions.
-5. Enter the PWA/API server URL and the code in Telecall Bridge, then tap `Pair this phone`.
-6. After the device is online, the agent can place calls from the PWA through the physical SIM.
+Sessions are opaque tokens stored in the database and sent as an `HttpOnly` cookie; they last
+12 hours and are revoked when an account is paused, deleted, or has its password reset. Every
+API route requires either a session or a device token.
 
-An installable debug APK is available at [`android/app/build/outputs/apk/debug/TelecallBridge-debug.apk`](/Users/archismandutta/Desktop/Telecall/android/app/build/outputs/apk/debug/TelecallBridge-debug.apk).
+## Known gaps
 
-The local UI accepts any non-empty username and password until a backend authentication service is connected. Agent accounts and generated call records are created during use; no accounts or calls are preloaded.
-
-## V1 implementation note
-
-This build includes the PWA, a small local API, and the first Android bridge implementation. Agent accounts and local call records persist in browser `localStorage`; the API persists paired devices and dispatched calls in `.data/telecall.json`. Before production, replace the development auth/storage with a real database and authenticated HTTPS API, and use a push transport instead of polling for stronger background delivery.
-# Telecall
+- The Android bridge reports a call that was declined as `Missed`; distinguishing **Rejected**
+  needs a change on the phone.
+- The bridge polls once a second and has no push transport, which is heavy on battery.
+- There is no SIM picker on dual-SIM handsets, and no Gradle wrapper in `android/`.

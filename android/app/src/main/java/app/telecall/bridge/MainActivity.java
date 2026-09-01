@@ -117,8 +117,14 @@ public class MainActivity extends Activity {
     private void pair() {
         if (!hasCallPermissions()) {
             waitingForPermissions = true;
-            if (android.os.Build.VERSION.SDK_INT >= 33) requestPermissions(new String[]{Manifest.permission.CALL_PHONE, Manifest.permission.READ_PHONE_STATE, Manifest.permission.ANSWER_PHONE_CALLS, Manifest.permission.POST_NOTIFICATIONS}, PERMISSION_REQUEST);
-            else requestPermissions(new String[]{Manifest.permission.CALL_PHONE, Manifest.permission.READ_PHONE_STATE, Manifest.permission.ANSWER_PHONE_CALLS}, PERMISSION_REQUEST);
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                requestPermissions(new String[]{Manifest.permission.CALL_PHONE, Manifest.permission.READ_PHONE_STATE,
+                        Manifest.permission.READ_CALL_LOG, Manifest.permission.ANSWER_PHONE_CALLS,
+                        Manifest.permission.POST_NOTIFICATIONS}, PERMISSION_REQUEST);
+            } else {
+                requestPermissions(new String[]{Manifest.permission.CALL_PHONE, Manifest.permission.READ_PHONE_STATE,
+                        Manifest.permission.READ_CALL_LOG, Manifest.permission.ANSWER_PHONE_CALLS}, PERMISSION_REQUEST);
+            }
             return;
         }
         performPair();
@@ -171,7 +177,9 @@ public class MainActivity extends Activity {
 
     private void updateStatus() {
         if (preferences.getString(DEVICE_TOKEN, "").isEmpty()) setStatus("Not paired", true);
-        else setStatus("Paired. Waiting for call requests.", false);
+        else if (checkSelfPermission(Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
+            setStatus("Paired, but call-log access is off. Talk time will be estimated instead of measured.", true);
+        } else setStatus("Paired. Waiting for call requests.", false);
     }
 
     private void setStatus(String value, boolean error) {

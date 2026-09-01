@@ -101,3 +101,50 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 
 .empty-state { min-height: 150px; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 6px; padding: 20px; text-align: center; }.empty-state-icon { width: 36px; height: 36px; display: grid; place-items: center; color: #4a9d91; background: #e4f4f0; border-radius: 10px; margin-bottom: 2px; }.empty-state strong { color: var(--ink); font-size: 12px; }.empty-state p { color: #98a1b0; font-size: 10px; margin: 0 0 8px; max-width: 230px; line-height: 1.45; }.activity-empty { min-height: 180px; height: 100%; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 7px; text-align: center; color: #4a9d91; }.activity-empty strong { color: #687589; font-size: 11px; }.activity-empty span { color: #a0a8b5; font-size: 10px; max-width: 230px; line-height: 1.45; }.outcome-empty { min-height: 210px; }.mini-chart-empty { height: 71px; display: grid; place-items: center; color: #adb5c0; font-size: 9px; }.bridge-pill.bridge-offline { color: #8b95a4; background: #f2f4f6; border-color: #e3e7eb; }.bridge-pill.bridge-offline svg { color: #9aa3af; }.bridge-required { color: #b36d60 !important; }.bridge-required i { background: #d68172 !important; }.call-button:disabled { background: #9ccbc3; box-shadow: none; cursor: not-allowed; }
 .modal-backdrop { position: fixed; z-index: 50; inset: 0; display: grid; place-items: center; padding: 20px; background: rgba(12, 19, 35, .42); }.pairing-modal { position: relative; width: min(390px, 100%); padding: 30px; text-align: center; }.modal-close { position: absolute; top: 12px; right: 12px; }.pairing-modal h2 { margin: 8px 0 8px; color: var(--ink); font: 800 22px Manrope, sans-serif; letter-spacing: -.05em; }.pairing-modal p { margin: 0 auto 20px; max-width: 285px; color: #8b95a5; font-size: 11px; line-height: 1.55; }.pairing-code { margin: 8px auto 12px; width: fit-content; color: var(--teal-dark); background: #e5f5f1; border: 1px solid #cceae3; border-radius: 10px; padding: 12px 20px; font: 800 29px Manrope, sans-serif; letter-spacing: .18em; }.pairing-modal > small { display: block; color: #a0a8b5; font-size: 10px; line-height: 1.5; }.pairing-loading { color: #8b95a5; font-size: 11px; padding: 22px 0 8px; }.device-connected { margin-right: 8px; }
+
+/* Boot, banners and notices */
+.boot-screen { min-height: 100vh; display: flex; flex-direction: column; gap: 14px; align-items: center; justify-content: center; background: var(--navy); color: #8fa0ad; font-size: 12px; }
+.app-banner { display: flex; align-items: center; gap: 10px; margin: 0; padding: 11px 42px; background: #e7f5f1; border-bottom: 1px solid #cfe9e2; color: #27756c; font-size: 12px; font-weight: 500; }
+.app-banner span { flex: 1; }
+.app-banner .icon-button { color: #4d968c; }
+.form-notice { background: #e9f6f2; color: #2c7d72; border: 1px solid #cbe8e0; border-radius: 6px; padding: 9px 11px; font-size: 10px; }
+
+/* Country code selector on the calling screen */
+.number-input .country-code { border: 0; outline: 0; background: transparent; color: #4b7f79; font-size: 13px; font-weight: 600; padding: 13px 9px 13px 0; border-right: 1px solid #e0edeb; cursor: pointer; }
+
+/* Agent table row actions */
+.row-actions { display: flex; align-items: center; gap: 4px; justify-content: flex-end; }
+.row-actions .view-button { margin-right: 4px; }
+.inline-select { border: 1px solid #dfe4ea; border-radius: 7px; background: #fff; color: #536078; font-size: 11px; font-weight: 600; padding: 10px 11px; }
+.inline-select:focus-visible { border-color: #82c5bb; }
+
+/* Manage agent dialog */
+.danger-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; border-radius: 7px; border: 1px solid #f0cdc7; background: #fff; color: #bd5747; font-size: 12px; font-weight: 600; padding: 10px 13px; white-space: nowrap; }
+.danger-button:hover { background: #fdf1ef; border-color: #e6b3ab; }
+.manage-modal { width: min(520px, 100%); text-align: left; max-height: 88vh; overflow-y: auto; }
+.manage-modal h2 { margin-bottom: 18px; }
+.manage-form { display: flex; flex-direction: column; gap: 13px; }
+.manage-form label { display: flex; flex-direction: column; gap: 6px; color: #5d6880; font-size: 11px; font-weight: 600; }
+.manage-form input, .manage-form select { border: 1px solid #dde3e9; border-radius: 7px; padding: 11px 12px; font-size: 13px; color: var(--ink); background: #fff; outline: 0; }
+.manage-form input:focus, .manage-form select:focus { border-color: #82c5bb; box-shadow: 0 0 0 3px rgba(46,144,132,.1); }
+.manage-form .input-prefix { display: flex; align-items: center; border: 1px solid #dde3e9; border-radius: 7px; background: #fff; padding-left: 11px; }
+.manage-form .input-prefix span { color: #9aa4b4; font-size: 13px; }
+.manage-form .input-prefix input { border: 0; box-shadow: none; padding-left: 4px; }
+.manage-form small { color: #96a0b0; font-size: 10px; font-weight: 400; }
+.manage-form .form-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 4px; }
+.manage-divider { height: 1px; background: var(--line); margin: 22px 0 4px; }
+.manage-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 0; border-bottom: 1px solid #f0f2f4; }
+.manage-row:last-child { border-bottom: 0; padding-bottom: 0; }
+.manage-row strong { display: block; color: var(--ink); font-size: 12.5px; font-weight: 600; }
+.manage-row p { margin: 4px 0 0; color: #939cac; font-size: 10.5px; line-height: 1.45; max-width: 30ch; }
+.manage-row-action { display: flex; align-items: center; gap: 8px; flex: none; }
+.manage-row-action input { width: 140px; border: 1px solid #dde3e9; border-radius: 7px; padding: 9px 11px; font-size: 12px; color: var(--ink); background: #fff; outline: 0; }
+.manage-row-action input:focus { border-color: #82c5bb; }
+.manage-row-action .secondary-button:disabled, .manage-form button:disabled, .call-button:disabled { opacity: .55; cursor: not-allowed; }
+
+@media (max-width: 620px) {
+  .manage-row { flex-direction: column; align-items: stretch; }
+  .manage-row-action { justify-content: flex-end; }
+  .manage-row-action input { flex: 1; width: auto; }
+  .app-banner { padding: 11px 18px; }
+}
