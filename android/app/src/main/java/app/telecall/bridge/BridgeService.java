@@ -15,6 +15,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.IBinder;
 import android.telephony.TelephonyManager;
+import android.telecom.TelecomManager;
 
 import org.json.JSONObject;
 
@@ -60,7 +61,10 @@ public class BridgeService extends Service {
         try {
             JSONObject result = getJson(baseUrl + "/api/devices/commands?token=" + token);
             JSONObject command = result.optJSONObject("command");
-            if (command != null && "PLACE_CALL".equals(command.optString("type"))) placeCall(command);
+            if (command != null) {
+                if ("PLACE_CALL".equals(command.optString("type"))) placeCall(command);
+                if ("END_CALL".equals(command.optString("type"))) endCall(command);
+            }
         } catch (Exception ignored) {
             // The next poll retries while the device is offline.
         }
@@ -78,9 +82,26 @@ public class BridgeService extends Service {
         postStatus(callId, "Calling", 0);
         try {
             if (checkSelfPermission(Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) throw new SecurityException("CALL_PHONE permission is not granted");
-            Intent intent = new Intent(Intent.ACTION_CALL, Uri.parse("tel:" + number));
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            startActivity(intent);
+            TelecomManager telecom = (TelecomManager) getSystemService(TELECOM_SERVICE);
+            if (telecom == null) throw new IllegalStateException("Phone calling service is unavailable");
+            telecom.placeCall(Uri.fromParts("tel", number, null), new android.os.Bundle());
+        } catch (Exception error) {
+            postStatus(callId, "Failed", 0);
+            clearActiveCall();
+        }
+    }
+
+    private void endCall(JSONObject command) {
+        String callId = command.optString("callId");
+        String activeCallId = getSharedPreferences(PREFS, MODE_PRIVATE).getString(ACTIVE_CALL, "");
+        if (!callId.equals(activeCallId)) {
+            postStatus(callId, "Failed", 0);
+            return;
+        }
+        try {
+            if (Build.VERSION.SDK_INT < 28 || checkSelfPermission(Manifest.permission.ANSWER_PHONE_CALLS) != PackageManager.PERMISSION_GRANTED) throw new SecurityException("ANSWER_PHONE_CALLS permission is not granted");
+            TelecomManager telecom = (TelecomManager) getSystemService(TELECOM_SERVICE);
+            if (telecom == null || !telecom.endCall()) throw new IllegalStateException("The phone call could not be ended");
         } catch (Exception error) {
             postStatus(callId, "Failed", 0);
             clearActiveCall();

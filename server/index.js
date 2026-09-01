@@ -211,7 +211,11 @@ const server = http.createServer(async (request, response) => {
       const device = state.devices[token]
       if (!device) return send(response, 401, { error: 'Unknown device token' })
       device.lastSeen = Date.now()
-      const command = state.commands.find(item => item.token === token && (!item.deliveredAt || Date.now() - item.deliveredAt > 30_000))
+      const command = state.commands.find(item => {
+        if (item.token !== token || item.deliveredAt) return false
+        const status = state.calls[item.callId]?.status
+        return item.type === 'PLACE_CALL' ? status === 'Queued' : item.type === 'END_CALL' && ['Calling', 'In progress', 'Ending'].includes(status)
+      })
       if (command) command.deliveredAt = Date.now()
       persist()
       return send(response, 200, { command: command ? { id: command.id, type: command.type, callId: command.callId, number: command.number } : null })
@@ -231,14 +235,35 @@ const server = http.createServer(async (request, response) => {
       return send(response, 200, { callId: call.id })
     }
 
+    const hangupMatch = route.match(/^\/api\/calls\/([^/]+)\/hangup$/)
+    if (hangupMatch && request.method === 'POST') {
+      const body = await readBody(request)
+      const call = state.calls[hangupMatch[1]]
+      if (!call) return send(response, 404, { error: 'Call not found' })
+      const device = deviceForAgent(state.agents[call.callerId])
+      if (!isConnected(device)) return send(response, 409, { error: 'Android device is not connected' })
+      if (body.status === 'Failed') call.pendingStatus = 'Failed'
+      if (call.status === 'Queued') {
+        call.status = body.status === 'Failed' ? 'Failed' : 'Rejected'
+      } else if (!['Answered', 'Missed', 'Rejected', 'Failed'].includes(call.status)) {
+        call.status = 'Ending'
+        const alreadyQueued = state.commands.some(item => item.callId === call.id && item.type === 'END_CALL' && !item.deliveredAt)
+        if (!alreadyQueued) state.commands.push({ id: id('command'), token: device.token, type: 'END_CALL', callId: call.id, number: call.number, deliveredAt: null })
+      }
+      call.updatedAt = new Date().toISOString()
+      persist()
+      return send(response, 200, { ok: true, call })
+    }
+
     const callStatusMatch = route.match(/^\/api\/calls\/([^/]+)\/status$/)
     if (callStatusMatch && request.method === 'POST') {
       const body = await readBody(request)
       const call = state.calls[callStatusMatch[1]]
       if (!call) return send(response, 404, { error: 'Call not found' })
-      call.status = body.status || call.status
+      call.status = call.pendingStatus || body.status || call.status
       call.seconds = Number(body.seconds) || 0
       call.updatedAt = new Date().toISOString()
+      if (['Answered', 'Missed', 'Rejected', 'Failed'].includes(call.status)) delete call.pendingStatus
       persist()
       return send(response, 200, { ok: true, call })
     }
