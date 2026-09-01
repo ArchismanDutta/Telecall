@@ -3,3 +3,4 @@ dist
 .data
 android/app/build
 .DS_Store
+android/local.properties
