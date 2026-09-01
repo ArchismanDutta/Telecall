@@ -31,6 +31,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Keeps the phone in step with the server: collects call commands, dials them through the SIM,
@@ -55,11 +56,23 @@ public class BridgeService extends Service {
     /** How long the radio may stay idle after dialling before the call is written off. */
     private static final long DIAL_GRACE_MS = 25_000L;
 
+    /**
+     * How long the line must stay idle before the call is treated as over.
+     *
+     * While a call is being set up the radio can report a momentary IDLE between going
+     * off-hook and the call actually connecting. Acting on the first IDLE ends the call a
+     * second or two after dialling -- the call carries on, but nothing is recorded past that
+     * point, so a minute-long conversation lands in the log as one or two seconds.
+     */
+    private static final long IDLE_CONFIRM_MS = 4_000L;
+
     private ScheduledExecutorService executor;   // call-state polling only
     private ExecutorService network;             // outbound reports, kept off the polling thread
     private TelephonyManager telephony;
     private Object callStateListener;
     private volatile int lastState = TelephonyManager.CALL_STATE_IDLE;
+    private volatile long idleSince = 0L;
+    private final AtomicBoolean finishing = new AtomicBoolean(false);
 
     @Override
     public void onCreate() {
@@ -142,6 +155,8 @@ public class BridgeService extends Service {
         if (callId.isEmpty()) return;
 
         if (state == TelephonyManager.CALL_STATE_OFFHOOK) {
+            idleSince = 0L; // the line came back: any pending end is cancelled
+            if (getSharedPreferences(PREFS, MODE_PRIVATE).getLong(OFFHOOK_AT, 0L) != 0L) return;
             long offhookAt = System.currentTimeMillis();
             edit().putLong(OFFHOOK_AT, offhookAt).apply();
             // Off-hook is the line going busy, which for an outgoing call is the start of
@@ -152,19 +167,42 @@ public class BridgeService extends Service {
             return;
         }
 
-        if (state == TelephonyManager.CALL_STATE_IDLE) {
-            long idleAt = System.currentTimeMillis();
-            long offhookAt = getSharedPreferences(PREFS, MODE_PRIVATE).getLong(OFFHOOK_AT, 0L);
-            if (offhookAt == 0L) {
-                // The radio never went off-hook, so nothing was ever dialled.
-                postFinal(callId, "Failed", 0, false, 0L, 0L, idleAt);
-                clearActiveCall();
-                return;
-            }
-            // The call log is written some time after the call ends, so this waits for it on
-            // its own thread rather than blocking the one-second state poll.
-            new Thread(() -> finishCall(callId, offhookAt, idleAt), "telecall-finish").start();
+        // An idle reading is only provisional here. settleIdle() decides whether it lasted.
+        if (state == TelephonyManager.CALL_STATE_IDLE && idleSince == 0L) {
+            idleSince = System.currentTimeMillis();
         }
+    }
+
+    /**
+     * Confirms an idle line before concluding the call, so a flicker during call setup cannot
+     * cut the recording short. Runs on every poll, once a second.
+     */
+    private void settleIdle(int state) {
+        String callId = pref(ACTIVE_CALL);
+        if (callId.isEmpty()) { idleSince = 0L; return; }
+
+        if (state != TelephonyManager.CALL_STATE_IDLE) { idleSince = 0L; return; }
+        if (idleSince == 0L) { idleSince = System.currentTimeMillis(); return; }
+        if (System.currentTimeMillis() - idleSince < IDLE_CONFIRM_MS) return;
+
+        long idleAt = idleSince;
+        idleSince = 0L;
+        if (!finishing.compareAndSet(false, true)) return;
+
+        long offhookAt = getSharedPreferences(PREFS, MODE_PRIVATE).getLong(OFFHOOK_AT, 0L);
+        if (offhookAt == 0L) {
+            // The radio never went off-hook, so nothing was ever dialled.
+            postFinal(callId, "Failed", 0, false, 0L, 0L, idleAt);
+            clearActiveCall();
+            finishing.set(false);
+            return;
+        }
+        // The call log is written some time after the call ends, so this waits for it on its
+        // own thread rather than blocking the one-second state poll.
+        new Thread(() -> {
+            try { finishCall(callId, offhookAt, idleAt); }
+            finally { finishing.set(false); }
+        }, "telecall-finish").start();
     }
 
     /**
@@ -256,6 +294,7 @@ public class BridgeService extends Service {
 
         int state = readCallState();
         if (state != lastState) onStateChanged(state);
+        settleIdle(state);
         expireUndialledCall();
 
         try {
@@ -336,6 +375,7 @@ public class BridgeService extends Service {
     }
 
     private void clearActiveCall() {
+        idleSince = 0L;
         edit().remove(ACTIVE_CALL).remove(ACTIVE_NUMBER).remove(OFFHOOK_AT).remove(DIALLED_AT).apply();
     }
 

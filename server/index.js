@@ -175,7 +175,9 @@ const reconcileCallState = async (device, callState) => {
   }
 
   if (callState !== 'IDLE') return
-  const settled = Date.now() - new Date(call.updated_at).getTime() > 6000
+  // Longer than the phone's own idle debounce, so this safety net never concludes a call
+  // ahead of the handset -- the handset's report is the accurate one.
+  const settled = Date.now() - new Date(call.updated_at).getTime() > 10_000
   if (!settled) return
 
   if (call.offhook_at) {

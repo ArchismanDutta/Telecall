@@ -90,10 +90,13 @@ check "OFFHOOK alone marks the call in progress"      "$(curl -s -b $AGENT_JAR $
 check "and records when the line went busy"           "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL2 | json '.offhookAt ? "set" : "missing"')" set
 curl -s "$BASE/api/devices/commands?token=$TOKEN&callState=IDLE" > /dev/null
 check "an immediate IDLE waits for the phone's own report" "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL2 | json '.status')" "In progress"
-sleep 7
+sleep 6
+curl -s "$BASE/api/devices/commands?token=$TOKEN&callState=IDLE" > /dev/null
+check "a brief idle flicker does not end the call"    "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL2 | json '.status')" "In progress"
+sleep 6
 curl -s "$BASE/api/devices/commands?token=$TOKEN&callState=IDLE" > /dev/null
 check "a settled IDLE closes the call"                "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL2 | json '.status')" Answered
-check "and derives a duration"                        "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL2 | json '.seconds >= 6 ? "yes" : "no"')" yes
+check "and derives a duration"                        "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL2 | json '.seconds >= 10 ? "yes" : "no"')" yes
 check "flagged an estimate, since it includes ringing" "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL2 | json '.estimated')" true
 
 echo; echo "Talk time excludes ringing"
