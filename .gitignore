@@ -4,3 +4,6 @@ dist
 android/app/build
 .DS_Store
 android/local.properties
+.env
+android/.gradle
+.telecall-build

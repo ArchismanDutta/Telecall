@@ -35,6 +35,10 @@ server creates on first boot — it prints the username and a generated password
 That password is shown once. Set `ADMIN_USERNAME` and `ADMIN_PASSWORD` before the first run to
 choose your own instead.
 
+Settings come from `.env` in the project root — copy [`.env.example`](./.env.example) if you
+do not have one. A real environment variable always wins over the file, so the same code runs
+unchanged on Render.
+
 With no `DATABASE_URL` the server runs an embedded Postgres (PGlite) that stores its data in
 `.data/`. It is meant for development only: it is not crash-safe, and a hard kill can force it
 to reset itself. Set `DATABASE_URL` to use a real Postgres locally.
@@ -48,31 +52,57 @@ npm test
 This boots a throwaway server and database and runs 36 checks across authentication, account
 management, device pairing, the call lifecycle and role-based visibility.
 
-## Deploying
+## Deploying to Render
 
-The included [`render.yaml`](./render.yaml) provisions one Node web service and one managed
-Postgres database, and serves the app and the API from the same HTTPS origin.
+Set up as **two** Render resources: a Postgres database and a Web Service.
 
-1. Push this repository to GitHub.
-2. In Render, choose **New → Blueprint** and select the repository.
-3. Render prompts for `ADMIN_USERNAME` and `ADMIN_PASSWORD`. Set both — otherwise the
-   generated password appears only in the deploy log.
-4. Open the `onrender.com` URL. `/api/health` reports `{"ok":true,"driver":"postgres"}` when
-   the database is wired up correctly.
-5. Enter that HTTPS URL in the Android Bridge app before pairing a phone.
+### 1. The database
 
-A free Render Postgres instance expires after a limited period; a free Neon database works the
-same way — set `DATABASE_URL` yourself and drop the `databases:` block.
+**New → Postgres.** Any plan; the free one expires after a limited period. Once it is live,
+copy the **Internal Database URL** from its dashboard — internal keeps the traffic on Render's
+private network and is faster than the external one.
 
-### Environment variables
+### 2. The web service
 
-| Variable | Purpose |
+**New → Web Service**, connected to this repository.
+
+| Setting | Value |
 | --- | --- |
-| `DATABASE_URL` | Postgres connection string. Falls back to the embedded development database when unset. |
-| `ADMIN_USERNAME` | Administrator username, created on first boot. Defaults to `admin`. |
-| `ADMIN_PASSWORD` | Administrator password. A random one is generated and logged if unset. |
-| `ALLOWED_ORIGINS` | Comma-separated origins allowed to call the API cross-origin. Not needed when the app and API share an origin. |
-| `PORT` | Defaults to `8787`. |
+| Language | Node |
+| Build command | `npm ci && npm run build` |
+| Start command | `npm start` |
+| Health check path | `/api/health` |
+
+Then add these environment variables:
+
+| Key | Value |
+| --- | --- |
+| `DATABASE_URL` | the Internal Database URL from step 1 |
+| `ADMIN_USERNAME` | `admin`, or whatever you prefer |
+| `ADMIN_PASSWORD` | the password you want for the administrator |
+| `NODE_ENV` | `production` — this marks the session cookie `Secure` |
+| `NODE_VERSION` | `22` |
+
+Deploy, then open the `onrender.com` URL. `/api/health` should report
+`{"ok":true,"driver":"postgres"}`. If it says `"driver":"pglite"` the service never saw
+`DATABASE_URL`, and everything it stores will vanish on the next deploy.
+
+Sign in at `/admin/login` with the username and password you set.
+
+> **The administrator account is created once**, on the first boot against an empty database.
+> Setting `ADMIN_PASSWORD` afterwards has no effect — reset the password from inside the app,
+> or drop the database to start over.
+
+TLS is negotiated automatically: the server tries an encrypted connection and falls back once
+if the database refuses one, which is what Render's internal URL sometimes does. Set
+`DATABASE_SSL=on` or `off` to decide it yourself.
+
+`ALLOWED_ORIGINS` is only needed if you ever serve the browser app from a different domain to
+the API. Serving both from the one Render service, as above, does not need it.
+
+The committed [`render.yaml`](./render.yaml) describes the same setup as a Blueprint, if you
+would rather Render provision both resources for you. It is ignored when you create the
+service by hand.
 
 ## Placing calls through a physical SIM
 

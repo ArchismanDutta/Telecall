@@ -1,3 +1,4 @@
+import './env.js' // must come first: db.js reads DATABASE_URL when it is imported
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -112,7 +113,9 @@ const publicCall = row => row && ({
   number: row.phone_number,
   status: row.status,
   seconds: Number(row.duration || 0),
+  estimated: Boolean(row.duration_estimated),
   startedAt: row.started_at,
+  offhookAt: row.offhook_at,
   answeredAt: row.answered_at,
   endedAt: row.ended_at,
   createdAt: row.created_at,
@@ -156,8 +159,11 @@ const reconcileCallState = async (device, callState) => {
 
   if (callState === 'OFFHOOK') {
     if (['Queued', 'Calling'].includes(call.status)) {
+      // Off-hook means the radio is busy -- for an outgoing call that is the moment dialling
+      // starts, not the moment anyone picks up. Android gives ordinary apps no answer signal,
+      // so answered_at stays null until the call log supplies it once the call ends.
       await query(
-        `UPDATE calls SET status = 'In progress', answered_at = COALESCE(answered_at, now()), updated_at = now() WHERE id = $1`,
+        `UPDATE calls SET status = 'In progress', offhook_at = COALESCE(offhook_at, now()), updated_at = now() WHERE id = $1`,
         [call.id],
       )
     }
@@ -168,10 +174,14 @@ const reconcileCallState = async (device, callState) => {
   const settled = Date.now() - new Date(call.updated_at).getTime() > 6000
   if (!settled) return
 
-  if (call.answered_at) {
+  if (call.offhook_at) {
+    // The phone never reported the outcome -- it crashed, lost the network, or has no
+    // call-log permission. All we can say is how long the line was busy, which includes
+    // the ringing, so it is flagged as an estimate rather than passed off as talk time.
     await query(
       `UPDATE calls SET status = 'Answered', ended_at = now(), updated_at = now(),
-              duration = GREATEST(0, EXTRACT(EPOCH FROM (now() - answered_at))::int)
+              duration = GREATEST(0, EXTRACT(EPOCH FROM (now() - offhook_at))::int),
+              duration_estimated = true
         WHERE id = $1`,
       [call.id],
     )
@@ -273,10 +283,28 @@ const server = http.createServer(async (request, response) => {
       const status = String(body.status || '')
       if (![...ACTIVE, ...TERMINAL].includes(status)) return reply(400, { error: 'Unrecognised call status' })
       const seconds = Math.max(0, Number(body.seconds) || 0)
+      const at = value => {
+        const ms = Number(value)
+        return Number.isFinite(ms) && ms > 0 ? new Date(ms).toISOString() : null
+      }
       if (status === 'In progress') {
-        await query("UPDATE calls SET status = $2, answered_at = COALESCE(answered_at, now()), updated_at = now() WHERE id = $1", [call.id, status])
+        await query(
+          `UPDATE calls SET status = $2, offhook_at = COALESCE($3::timestamptz, offhook_at, now()), updated_at = now() WHERE id = $1`,
+          [call.id, status, at(body.offhookAtMs)],
+        )
       } else if (TERMINAL.includes(status)) {
-        await query('UPDATE calls SET status = $2, duration = $3, ended_at = now(), updated_at = now() WHERE id = $1', [call.id, status, seconds])
+        // The phone reads the connected duration out of the call log, so `seconds` here is
+        // real talk time and answeredAtMs is the moment the other end actually picked up.
+        await query(
+          `UPDATE calls SET status = $2, duration = $3, duration_estimated = $4,
+                  offhook_at  = COALESCE($5::timestamptz, offhook_at),
+                  answered_at = COALESCE($6::timestamptz, answered_at),
+                  ended_at    = COALESCE($7::timestamptz, now()),
+                  updated_at  = now()
+            WHERE id = $1`,
+          [call.id, status, seconds, Boolean(body.estimated),
+           at(body.offhookAtMs), at(body.answeredAtMs), at(body.endedAtMs)],
+        )
       } else {
         await query('UPDATE calls SET status = $2, updated_at = now() WHERE id = $1', [call.id, status])
       }

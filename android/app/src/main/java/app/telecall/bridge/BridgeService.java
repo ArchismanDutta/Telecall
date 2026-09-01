@@ -139,39 +139,51 @@ public class BridgeService extends Service {
         if (callId.isEmpty()) return;
 
         if (state == TelephonyManager.CALL_STATE_OFFHOOK) {
-            edit().putLong(OFFHOOK_AT, System.currentTimeMillis()).apply();
-            postStatus(callId, "In progress", 0);
+            long offhookAt = System.currentTimeMillis();
+            edit().putLong(OFFHOOK_AT, offhookAt).apply();
+            // Off-hook is the line going busy, which for an outgoing call is the start of
+            // dialling -- not the moment anyone answers. Android tells ordinary apps nothing
+            // about the remote party picking up, so the answer time is worked out from the
+            // call log once the call has ended.
+            postProgress(callId, offhookAt);
             return;
         }
 
         if (state == TelephonyManager.CALL_STATE_IDLE) {
+            long idleAt = System.currentTimeMillis();
             long offhookAt = getSharedPreferences(PREFS, MODE_PRIVATE).getLong(OFFHOOK_AT, 0L);
             if (offhookAt == 0L) {
                 // The radio never went off-hook, so nothing was ever dialled.
-                postStatus(callId, "Failed", 0);
+                postFinal(callId, "Failed", 0, false, 0L, 0L, idleAt);
                 clearActiveCall();
                 return;
             }
             // The call log is written a moment after the call ends.
-            executor.schedule(() -> finishCall(callId, offhookAt), 1400, TimeUnit.MILLISECONDS);
+            executor.schedule(() -> finishCall(callId, offhookAt, idleAt), 1400, TimeUnit.MILLISECONDS);
         }
     }
 
     /**
-     * Decides the outcome from the call log, which records the connected duration only --
-     * zero means the other end never picked up. Falls back to wall-clock timing when the
-     * call-log permission was declined.
+     * Works out what actually happened from the call log, which counts connected seconds
+     * only: zero means the other end never picked up, and anything above that is real talk
+     * time with the ringing excluded. Because the log gives the talk time and we know when
+     * the call ended, the moment of pickup is simply one subtracted from the other.
+     *
+     * Without call-log permission none of that is knowable, so the report falls back to how
+     * long the line was busy and is flagged as an estimate rather than passed off as talk time.
      */
-    private void finishCall(String callId, long offhookAt) {
+    private void finishCall(String callId, long offhookAt, long idleAt) {
         String number = pref(ACTIVE_NUMBER);
-        long elapsed = Math.max(0, (System.currentTimeMillis() - offhookAt) / 1000);
-        Integer logged = callLogDuration(number);
-        if (logged == null) {
-            postStatus(callId, "Answered", (int) elapsed);
-        } else if (logged > 0) {
-            postStatus(callId, "Answered", logged);
+        Integer talkSeconds = callLogDuration(number);
+
+        if (talkSeconds == null) {
+            int busySeconds = (int) Math.max(0, (idleAt - offhookAt) / 1000);
+            postFinal(callId, "Answered", busySeconds, true, offhookAt, 0L, idleAt);
+        } else if (talkSeconds > 0) {
+            long answeredAt = idleAt - talkSeconds * 1000L;
+            postFinal(callId, "Answered", talkSeconds, false, offhookAt, answeredAt, idleAt);
         } else {
-            postStatus(callId, "Missed", 0);
+            postFinal(callId, "Missed", 0, false, offhookAt, 0L, idleAt);
         }
         clearActiveCall();
     }
@@ -296,7 +308,24 @@ public class BridgeService extends Service {
         edit().remove(ACTIVE_CALL).remove(ACTIVE_NUMBER).remove(OFFHOOK_AT).remove(DIALLED_AT).apply();
     }
 
+    /** A plain status change with no timing attached. */
     private void postStatus(String callId, String status, int seconds) {
+        send(callId, status, seconds, false, 0L, 0L, 0L);
+    }
+
+    /** The line went busy: tells the server when dialling began. */
+    private void postProgress(String callId, long offhookAt) {
+        send(callId, "In progress", 0, false, offhookAt, 0L, 0L);
+    }
+
+    /** The measured outcome: talk time, when it was picked up, and when it ended. */
+    private void postFinal(String callId, String status, int seconds, boolean estimated,
+                           long offhookAt, long answeredAt, long endedAt) {
+        send(callId, status, seconds, estimated, offhookAt, answeredAt, endedAt);
+    }
+
+    private void send(String callId, String status, int seconds, boolean estimated,
+                      long offhookAt, long answeredAt, long endedAt) {
         String baseUrl = pref(SERVER);
         String token = pref(TOKEN);
         if (baseUrl.isEmpty() || token.isEmpty() || callId.isEmpty()) return;
@@ -306,6 +335,10 @@ public class BridgeService extends Service {
                 body.put("token", token);
                 body.put("status", status);
                 body.put("seconds", seconds);
+                body.put("estimated", estimated);
+                if (offhookAt  > 0) body.put("offhookAtMs", offhookAt);
+                if (answeredAt > 0) body.put("answeredAtMs", answeredAt);
+                if (endedAt    > 0) body.put("endedAtMs", endedAt);
                 postJson(baseUrl + "/api/calls/" + callId + "/status", body);
             } catch (Exception ignored) {
                 // The server reconciles from the reported call state if this never lands.

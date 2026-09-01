@@ -71,7 +71,8 @@ check "the phone receives PLACE_CALL"                 "$CMD" PLACE_CALL
 check "an unauthenticated status post is refused"     "$(code -X POST $BASE/api/calls/$CALL/status -H 'Content-Type: application/json' -d '{"status":"Answered","seconds":99}')" 401
 curl -s -X POST $BASE/api/calls/$CALL/status -H 'Content-Type: application/json' -d "{\"token\":\"$TOKEN\",\"status\":\"Calling\"}" > /dev/null
 curl -s -X POST $BASE/api/calls/$CALL/status -H 'Content-Type: application/json' -d "{\"token\":\"$TOKEN\",\"status\":\"In progress\"}" > /dev/null
-check "answering records answered_at"                 "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL | json '.answeredAt ? "set" : "missing"')" set
+check "going off-hook records when dialling began"    "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL | json '.offhookAt ? "set" : "missing"')" set
+check "but not an answer time -- nobody has picked up yet" "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL | json '.answeredAt ? "set" : "none"')" none
 curl -s -X POST $BASE/api/calls/$CALL/status -H 'Content-Type: application/json' -d "{\"token\":\"$TOKEN\",\"status\":\"Answered\",\"seconds\":272}" > /dev/null
 check "the finished call keeps its duration"          "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL | json '.seconds')" 272
 check "the finished call records ended_at"            "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL | json '.endedAt ? "set" : "missing"')" set
@@ -86,21 +87,41 @@ curl -s "$BASE/api/devices/commands?token=$TOKEN&callState=IDLE" > /dev/null
 check "a queued call is not concluded early"          "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL2 | json '.status')" Queued
 curl -s "$BASE/api/devices/commands?token=$TOKEN&callState=OFFHOOK" > /dev/null
 check "OFFHOOK alone marks the call in progress"      "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL2 | json '.status')" "In progress"
-check "and records when the line went live"           "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL2 | json '.answeredAt ? "set" : "missing"')" set
+check "and records when the line went busy"           "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL2 | json '.offhookAt ? "set" : "missing"')" set
 curl -s "$BASE/api/devices/commands?token=$TOKEN&callState=IDLE" > /dev/null
 check "an immediate IDLE waits for the phone's own report" "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL2 | json '.status')" "In progress"
 sleep 7
 curl -s "$BASE/api/devices/commands?token=$TOKEN&callState=IDLE" > /dev/null
 check "a settled IDLE closes the call"                "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL2 | json '.status')" Answered
-check "and derives the talk time"                     "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL2 | json '.seconds >= 6 ? "measured" : "wrong"')" measured
+check "and derives a duration"                        "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL2 | json '.seconds >= 6 ? "yes" : "no"')" yes
+check "flagged an estimate, since it includes ringing" "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL2 | json '.estimated')" true
+
+echo; echo "Talk time excludes ringing"
+# The exact case that was wrong: a call that rings for 5 seconds and is then talked on for
+# 3 minutes must record 180 seconds of talk time, not 185. The phone reads the connected
+# duration out of its call log and works the pickup moment out backwards from it.
+CALL3=$(curl -s -b $AGENT_JAR -X POST $BASE/api/calls/dispatch -H 'Content-Type: application/json' -d '{"number":"+919000000002"}' | json '.callId')
+curl -s "$BASE/api/devices/commands?token=$TOKEN" > /dev/null
+NOW=$(node -pe 'Date.now()')
+DIALLED=$((NOW - 185000))    # went off-hook 185s ago
+ANSWERED=$((NOW - 180000))   # picked up 5s later
+curl -s -X POST $BASE/api/calls/$CALL3/status -H 'Content-Type: application/json' \
+  -d "{\"token\":\"$TOKEN\",\"status\":\"In progress\",\"offhookAtMs\":$DIALLED}" > /dev/null
+curl -s -X POST $BASE/api/calls/$CALL3/status -H 'Content-Type: application/json' \
+  -d "{\"token\":\"$TOKEN\",\"status\":\"Answered\",\"seconds\":180,\"estimated\":false,\"offhookAtMs\":$DIALLED,\"answeredAtMs\":$ANSWERED,\"endedAtMs\":$NOW}" > /dev/null
+check "talk time is the connected 180s, not 185s"     "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL3 | json '.seconds')" 180
+check "it is marked measured, not estimated"          "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL3 | json '.estimated')" false
+check "the pickup moment is recorded"                 "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL3 | json '.answeredAt ? "set" : "missing"')" set
+check "the end moment is recorded"                    "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL3 | json '.endedAt ? "set" : "missing"')" set
+check "ring time comes out as 5s"                     "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL3 | json 'Math.round((new Date(.answeredAt)-new Date(.offhookAt))/1000)' 2>/dev/null || curl -s -b $AGENT_JAR $BASE/api/calls/$CALL3 | node -pe 'const c=JSON.parse(require("fs").readFileSync(0,"utf8"));Math.round((new Date(c.answeredAt)-new Date(c.offhookAt))/1000)')" 5
 
 echo; echo "Visibility"
-check "the ADMIN sees the telecaller's calls"         "$(curl -s -b $JAR "$BASE/api/calls?userId=$PID" | json '.length')" 2
-check "the telecaller sees their own calls"           "$(curl -s -b $AGENT_JAR $BASE/api/calls | json '.length')" 2
-check "today's counter reflects the calls"            "$(curl -s -b $JAR $BASE/api/telecallers | json '[0].callsToday')" 2
-check "talk time is aggregated"                       "$(curl -s -b $JAR $BASE/api/telecallers | json '[0].talkTodaySeconds >= 278 ? "summed" : "wrong"')" summed
+check "the ADMIN sees the telecaller's calls"         "$(curl -s -b $JAR "$BASE/api/calls?userId=$PID" | json '.length')" 3
+check "the telecaller sees their own calls"           "$(curl -s -b $AGENT_JAR $BASE/api/calls | json '.length')" 3
+check "today's counter reflects the calls"            "$(curl -s -b $JAR $BASE/api/telecallers | json '[0].callsToday')" 3
+check "talk time is aggregated"                       "$(curl -s -b $JAR $BASE/api/telecallers | json '[0].talkTodaySeconds >= 458 ? "summed" : "wrong"')" summed
 OTHER=$(curl -s -b $JAR -X POST $BASE/api/telecallers -H 'Content-Type: application/json' -d '{"name":"Rahul Verma","username":"rahul","password":"rahul123"}' | json '.id')
-check "a telecaller's userId filter is ignored"       "$(curl -s -b $AGENT_JAR "$BASE/api/calls?userId=$OTHER" | json '.length')" 2
+check "a telecaller's userId filter is ignored"       "$(curl -s -b $AGENT_JAR "$BASE/api/calls?userId=$OTHER" | json '.length')" 3
 check "a date range outside the call excludes it"     "$(curl -s -b $JAR "$BASE/api/calls?userId=$PID&from=2020-01-01&to=2020-01-31" | json '.length')" 0
 
 echo; echo "Account status"

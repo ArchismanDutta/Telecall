@@ -44,10 +44,17 @@ const formatDuration = seconds => {
 
 const decorateCall = call => {
   const created = new Date(call.createdAt)
+  // How long it rang before the other end picked up. Known only once the call has ended,
+  // because the phone works the answer time out backwards from the call log.
+  const ringSeconds = call.answeredAt && call.offhookAt
+    ? Math.max(0, Math.round((new Date(call.answeredAt) - new Date(call.offhookAt)) / 1000))
+    : null
   return {
     ...call,
     date: dateKey(created),
     time: created.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }),
+    answeredTime: call.answeredAt ? new Date(call.answeredAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '',
+    ringSeconds,
     duration: clock(Number(call.seconds) || 0),
   }
 }
@@ -87,12 +94,18 @@ const downloadCsv = (filename, rows) => {
   URL.revokeObjectURL(url)
 }
 
+const iso = value => (value ? new Date(value).toISOString() : '')
+
 const callsToCsv = (calls, callers, filename) => downloadCsv(filename, [
-  ['Date', 'Time', 'Agent', 'Phone number', 'Outcome', 'Duration (s)', 'Duration'],
+  ['Date', 'Dialled', 'Agent', 'Phone number', 'Outcome',
+   'Answered at', 'Ended at', 'Ring (s)', 'Talk time (s)', 'Talk time', 'Measured'],
   ...calls.map(call => [
     call.date, call.time,
     callers.find(caller => caller.id === call.callerId)?.name || '',
-    call.number, call.status, call.seconds, call.duration,
+    call.number, call.status,
+    iso(call.answeredAt), iso(call.endedAt),
+    call.ringSeconds ?? '', call.seconds, call.duration,
+    call.estimated ? 'estimated' : 'measured',
   ]),
 ])
 
@@ -263,7 +276,7 @@ function OutcomeChart({ calls = [] }) {
 
 function CallsTable({ calls, callers, showCaller = true, limit, emptyText = 'No calls found' }) {
   const rows = limit ? calls.slice(0, limit) : calls
-  return <div className="table-wrap"><table><thead><tr><th>Date &amp; time</th>{showCaller && <th>Agent</th>}<th>Phone number</th><th>Outcome</th><th>Duration</th></tr></thead><tbody>
+  return <div className="table-wrap"><table><thead><tr><th>Date &amp; time</th>{showCaller && <th>Agent</th>}<th>Phone number</th><th>Outcome</th><th>Talk time</th></tr></thead><tbody>
     {rows.length ? rows.map(call => {
       const caller = callers.find(item => item.id === call.callerId)
       const dateLabel = call.date === todayKey() ? 'Today' : formatDate(new Date(`${call.date}T00:00:00`))
@@ -272,7 +285,10 @@ function CallsTable({ calls, callers, showCaller = true, limit, emptyText = 'No 
         {showCaller && <td><div className="person-cell"><Avatar caller={caller} small /><span>{caller?.name || 'Removed agent'}</span></div></td>}
         <td className="number-cell">{call.number}</td>
         <td><OutcomeBadge status={call.status} /></td>
-        <td className="duration-cell">{call.duration}</td>
+        <td className="duration-cell">
+          <strong className="table-date" title={call.estimated ? 'Estimated: the phone could not read its call log, so this includes ringing.' : 'Talk time, measured from the call log'}>{call.estimated ? `~${call.duration}` : call.duration}</strong>
+          <span className="table-sub">{call.ringSeconds !== null ? `rang ${call.ringSeconds}s` : call.estimated ? 'estimated' : ''}</span>
+        </td>
       </tr>
     }) : <tr><td colSpan={showCaller ? 5 : 4} className="empty-cell">{emptyText}</td></tr>}
   </tbody></table></div>
@@ -610,10 +626,12 @@ function CallerDashboard({ me, calls, refresh, navigate, onLogout }) {
         if (TERMINAL.includes(call.status)) {
           setActive(null)
           setNumber('')
-          setOutcome(`${call.status}${call.seconds ? ` · ${clock(call.seconds)} talk time` : ''}`)
+          setOutcome(call.status === 'Answered'
+            ? `Answered · ${clock(call.seconds)} talk time${call.estimated ? ' (estimated)' : ''}`
+            : call.status)
           refresh()
         } else {
-          setActive(current => current && { ...current, status: call.status, answeredAt: call.answeredAt })
+          setActive(current => current && { ...current, status: call.status, offhookAt: call.offhookAt })
         }
       } catch { /* transient: the next tick retries */ }
     }
@@ -623,11 +641,11 @@ function CallerDashboard({ me, calls, refresh, navigate, onLogout }) {
   }, [active?.id, refresh])
 
   useEffect(() => {
-    if (!active?.answeredAt) { setSeconds(0); return undefined }
-    const answered = new Date(active.answeredAt).getTime()
-    const timer = setInterval(() => setSeconds(Math.max(0, Math.floor((Date.now() - answered) / 1000))), 250)
+    if (!active?.offhookAt) { setSeconds(0); return undefined }
+    const offhook = new Date(active.offhookAt).getTime()
+    const timer = setInterval(() => setSeconds(Math.max(0, Math.floor((Date.now() - offhook) / 1000))), 250)
     return () => clearInterval(timer)
-  }, [active?.answeredAt])
+  }, [active?.offhookAt])
 
   const digits = number.replace(/\D/g, '')
   const todayCalls = calls.filter(call => call.date === todayKey())
@@ -647,7 +665,7 @@ function CallerDashboard({ me, calls, refresh, navigate, onLogout }) {
   }
 
   const connected = active?.status === 'In progress'
-  const label = connected ? 'CALL IN PROGRESS' : active?.status === 'Calling' ? 'RINGING' : active?.status === 'Ending' ? 'HANGING UP' : 'SENDING TO PHONE'
+  const label = connected ? 'ON THE LINE' : active?.status === 'Calling' ? 'DIALLING' : active?.status === 'Ending' ? 'HANGING UP' : 'SENDING TO PHONE'
 
   return <div className="caller-app">
     <CallerHeader me={me} onLogout={onLogout} />
@@ -666,7 +684,9 @@ function CallerDashboard({ me, calls, refresh, navigate, onLogout }) {
               <span className="eyebrow">{label}</span>
               <h2>{active.number}</h2>
               <strong className="call-timer">{connected ? clock(seconds) : active.status === 'Calling' ? 'Ringing…' : 'Connecting…'}</strong>
-              <p>{connected ? 'Connected through the phone&rsquo;s SIM.' : 'Waiting for the Android phone to place the call.'}</p>
+              <p>{connected
+                ? 'Time since dialling, including the ringing. Exact talk time is recorded when the call ends.'
+                : 'Waiting for the Android phone to place the call.'}</p>
             </div>
             <div className="call-controls">
               <button className="end-call" onClick={endCall} disabled={active.status === 'Ending'}><Icon name="phone" size={19} />{active.status === 'Ending' ? 'Ending…' : connected ? 'End call' : 'Cancel'}</button>

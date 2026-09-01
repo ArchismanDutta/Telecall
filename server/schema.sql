@@ -28,9 +28,11 @@ CREATE TABLE IF NOT EXISTS calls (
   phone_number text NOT NULL,
   status       text NOT NULL DEFAULT 'Queued',
   started_at   timestamptz,
+  offhook_at   timestamptz,
   answered_at  timestamptz,
   ended_at     timestamptz,
   duration     integer NOT NULL DEFAULT 0,
+  duration_estimated boolean NOT NULL DEFAULT false,
   created_at   timestamptz NOT NULL DEFAULT now(),
   updated_at   timestamptz NOT NULL DEFAULT now()
 );
@@ -61,3 +63,5 @@ CREATE TABLE IF NOT EXISTS commands (
 CREATE INDEX IF NOT EXISTS commands_pending ON commands (device_token, delivered_at);
 
 ALTER TABLE calls ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
+ALTER TABLE calls ADD COLUMN IF NOT EXISTS offhook_at timestamptz;
+ALTER TABLE calls ADD COLUMN IF NOT EXISTS duration_estimated boolean NOT NULL DEFAULT false;
