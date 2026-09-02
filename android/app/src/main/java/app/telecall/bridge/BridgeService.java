@@ -191,9 +191,8 @@ public class BridgeService extends Service {
 
         long offhookAt = getSharedPreferences(PREFS, MODE_PRIVATE).getLong(OFFHOOK_AT, 0L);
         if (offhookAt == 0L) {
-            // The radio never went off-hook, so nothing was ever dialled.
-            postFinal(callId, "Failed", 0, false, 0L, 0L, idleAt);
-            clearActiveCall();
+            // Dialling has not reached the radio yet. Leave it alone -- expireUndialledCall
+            // writes the call off after the full grace period rather than after four seconds.
             finishing.set(false);
             return;
         }
@@ -216,16 +215,28 @@ public class BridgeService extends Service {
      */
     private void finishCall(String callId, long offhookAt, long idleAt) {
         String number = pref(ACTIVE_NUMBER);
-        Integer talkSeconds = awaitCallLogDuration(number, offhookAt);
+        // Anchor the call-log search to the moment this call was dispatched, not to when the
+        // radio was seen going off-hook. The log's DATE column is when dialling began, which
+        // is always at or after dispatch but can be well BEFORE off-hook is noticed -- so
+        // anchoring on off-hook rejected the very row we were looking for and fell back to a
+        // guess. Dispatch is also after any earlier call to the same number, so a stale row
+        // still cannot match.
+        long dialledAt = getSharedPreferences(PREFS, MODE_PRIVATE).getLong(DIALLED_AT, offhookAt);
+        Integer talkSeconds = awaitCallLogDuration(number, dialledAt);
+        long startedAt = dialledAt > 0 ? dialledAt : offhookAt;
 
         if (talkSeconds == null) {
+            // No call log to read. All that is knowable is how long the line was busy, which
+            // includes the ringing, so it goes up flagged rather than as a measurement.
             int busySeconds = (int) Math.max(0, (idleAt - offhookAt) / 1000);
-            postFinal(callId, "Answered", busySeconds, true, offhookAt, 0L, idleAt);
+            postFinal(callId, "Answered", busySeconds, true, startedAt, offhookAt, 0L, idleAt);
         } else if (talkSeconds > 0) {
+            // Exact: the OS counted these seconds from connection to hang-up.
             long answeredAt = idleAt - talkSeconds * 1000L;
-            postFinal(callId, "Answered", talkSeconds, false, offhookAt, answeredAt, idleAt);
+            postFinal(callId, "Answered", talkSeconds, false, startedAt, offhookAt, answeredAt, idleAt);
         } else {
-            postFinal(callId, "Missed", 0, false, offhookAt, 0L, idleAt);
+            // The log recorded a zero-length connection: it rang out or was declined.
+            postFinal(callId, "Missed", 0, false, startedAt, offhookAt, 0L, idleAt);
         }
         clearActiveCall();
     }
@@ -237,9 +248,9 @@ public class BridgeService extends Service {
      * happens when the same number is dialled twice while testing. So this waits for the row
      * belonging to this call to appear, and never settles for an older one.
      */
-    private Integer awaitCallLogDuration(String number, long offhookAt) {
-        for (int attempt = 0; attempt < 10; attempt++) {
-            Integer duration = callLogDuration(number, offhookAt);
+    private Integer awaitCallLogDuration(String number, long notBefore) {
+        for (int attempt = 0; attempt < 25; attempt++) {
+            Integer duration = callLogDuration(number, notBefore);
             if (duration != null) return duration;
             try {
                 Thread.sleep(800);
@@ -270,9 +281,10 @@ public class BridgeService extends Service {
                     new String[]{CallLog.Calls.NUMBER, CallLog.Calls.DURATION, CallLog.Calls.DATE},
                     CallLog.Calls.TYPE + " = ? AND " + CallLog.Calls.DATE + " >= ?",
                     new String[]{String.valueOf(CallLog.Calls.OUTGOING_TYPE), String.valueOf(floor)},
-                    CallLog.Calls.DATE + " DESC LIMIT 5");
+                    CallLog.Calls.DATE + " DESC");
             if (cursor == null) return null;
-            while (cursor.moveToNext()) {
+            int examined = 0;
+            while (cursor.moveToNext() && examined++ < 10) {
                 String logged = cursor.getString(0) == null ? "" : cursor.getString(0).replaceAll("[^0-9]", "");
                 if (cursor.getLong(2) < floor) continue;
                 if (tail.isEmpty() || logged.endsWith(tail)) return (int) cursor.getLong(1);
@@ -381,22 +393,22 @@ public class BridgeService extends Service {
 
     /** A plain status change with no timing attached. */
     private void postStatus(String callId, String status, int seconds) {
-        send(callId, status, seconds, false, 0L, 0L, 0L);
+        send(callId, status, seconds, false, 0L, 0L, 0L, 0L);
     }
 
     /** The line went busy: tells the server when dialling began. */
     private void postProgress(String callId, long offhookAt) {
-        send(callId, "In progress", 0, false, offhookAt, 0L, 0L);
+        send(callId, "In progress", 0, false, 0L, offhookAt, 0L, 0L);
     }
 
     /** The measured outcome: talk time, when it was picked up, and when it ended. */
     private void postFinal(String callId, String status, int seconds, boolean estimated,
-                           long offhookAt, long answeredAt, long endedAt) {
-        send(callId, status, seconds, estimated, offhookAt, answeredAt, endedAt);
+                           long startedAt, long offhookAt, long answeredAt, long endedAt) {
+        send(callId, status, seconds, estimated, startedAt, offhookAt, answeredAt, endedAt);
     }
 
     private void send(String callId, String status, int seconds, boolean estimated,
-                      long offhookAt, long answeredAt, long endedAt) {
+                      long startedAt, long offhookAt, long answeredAt, long endedAt) {
         String baseUrl = pref(SERVER);
         String token = pref(TOKEN);
         if (baseUrl.isEmpty() || token.isEmpty() || callId.isEmpty()) return;
@@ -407,6 +419,7 @@ public class BridgeService extends Service {
                 body.put("status", status);
                 body.put("seconds", seconds);
                 body.put("estimated", estimated);
+                if (startedAt  > 0) body.put("startedAtMs", startedAt);
                 if (offhookAt  > 0) body.put("offhookAtMs", offhookAt);
                 if (answeredAt > 0) body.put("answeredAtMs", answeredAt);
                 if (endedAt    > 0) body.put("endedAtMs", endedAt);

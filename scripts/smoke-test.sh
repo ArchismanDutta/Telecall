@@ -23,7 +23,8 @@ code() { curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$@"; }
 json() { node -pe "try{JSON.parse(require('fs').readFileSync(0,'utf8'))$1 ?? ''}catch(e){''}"; }
 
 echo "Starting server on port $PORT…"
-PORT=$PORT PGLITE_DIR="$DBDIR/db" ADMIN_USERNAME=admin ADMIN_PASSWORD=admin123 \
+# A short settle window keeps the reconciliation checks quick; production waits 35s.
+PORT=$PORT PGLITE_DIR="$DBDIR/db" ADMIN_USERNAME=admin ADMIN_PASSWORD=admin123 IDLE_SETTLE_MS=10000 \
   node server/index.js > "$DBDIR/server.log" 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 40); do sleep 1; curl -s --max-time 2 -o /dev/null "$BASE/api/health" && break; done
@@ -111,8 +112,9 @@ ANSWERED=$((NOW - 180000))   # picked up 5s later
 curl -s -X POST $BASE/api/calls/$CALL3/status -H 'Content-Type: application/json' \
   -d "{\"token\":\"$TOKEN\",\"status\":\"In progress\",\"offhookAtMs\":$DIALLED}" > /dev/null
 curl -s -X POST $BASE/api/calls/$CALL3/status -H 'Content-Type: application/json' \
-  -d "{\"token\":\"$TOKEN\",\"status\":\"Answered\",\"seconds\":180,\"estimated\":false,\"offhookAtMs\":$DIALLED,\"answeredAtMs\":$ANSWERED,\"endedAtMs\":$NOW}" > /dev/null
+  -d "{\"token\":\"$TOKEN\",\"status\":\"Answered\",\"seconds\":180,\"estimated\":false,\"startedAtMs\":$DIALLED,\"offhookAtMs\":$DIALLED,\"answeredAtMs\":$ANSWERED,\"endedAtMs\":$NOW}" > /dev/null
 check "talk time is the connected 180s, not 185s"     "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL3 | json '.seconds')" 180
+check "the dial moment is recorded from the phone"    "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL3 | json '.startedAt ? "set" : "missing"')" set
 check "it is marked measured, not estimated"          "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL3 | json '.estimated')" false
 check "the pickup moment is recorded"                 "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL3 | json '.answeredAt ? "set" : "missing"')" set
 check "the end moment is recorded"                    "$(curl -s -b $AGENT_JAR $BASE/api/calls/$CALL3 | json '.endedAt ? "set" : "missing"')" set

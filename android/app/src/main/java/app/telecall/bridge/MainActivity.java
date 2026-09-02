@@ -33,6 +33,7 @@ public class MainActivity extends Activity {
     private EditText serverInput;
     private EditText codeInput;
     private TextView statusView;
+    private Button permissionButton;
     private boolean waitingForPermissions;
 
     @Override
@@ -83,7 +84,15 @@ public class MainActivity extends Activity {
         Button pairButton = new Button(this);
         pairButton.setText("Pair this phone");
         pairButton.setOnClickListener(view -> pair());
-        root.addView(pairButton, margin(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT, 0, 0, 0, 20));
+        root.addView(pairButton, margin(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT, 0, 0, 0, 12));
+
+        permissionButton = new Button(this);
+        permissionButton.setText("Grant phone permissions");
+        permissionButton.setOnClickListener(view -> {
+            waitingForPermissions = true;
+            requestPermissions(requiredPermissions(), PERMISSION_REQUEST);
+        });
+        root.addView(permissionButton, margin(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT, 0, 0, 0, 20));
 
         statusView = new TextView(this);
         statusView.setTextSize(15);
@@ -117,22 +126,33 @@ public class MainActivity extends Activity {
     private void pair() {
         if (!hasCallPermissions()) {
             waitingForPermissions = true;
-            if (android.os.Build.VERSION.SDK_INT >= 33) {
-                requestPermissions(new String[]{Manifest.permission.CALL_PHONE, Manifest.permission.READ_PHONE_STATE,
-                        Manifest.permission.READ_CALL_LOG, Manifest.permission.ANSWER_PHONE_CALLS,
-                        Manifest.permission.POST_NOTIFICATIONS}, PERMISSION_REQUEST);
-            } else {
-                requestPermissions(new String[]{Manifest.permission.CALL_PHONE, Manifest.permission.READ_PHONE_STATE,
-                        Manifest.permission.READ_CALL_LOG, Manifest.permission.ANSWER_PHONE_CALLS}, PERMISSION_REQUEST);
-            }
+            requestPermissions(requiredPermissions(), PERMISSION_REQUEST);
             return;
         }
         performPair();
     }
 
+    /**
+     * Call-log access is included deliberately. It is what makes talk time exact rather than
+     * estimated, and leaving it out of this check meant an upgrade over an older install --
+     * where the other permissions were already granted -- never asked for it at all, so every
+     * call silently fell back to timing the line instead of reading the recorded duration.
+     */
     private boolean hasCallPermissions() {
-        return checkSelfPermission(Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED
-                && checkSelfPermission(Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED;
+        for (String permission : requiredPermissions()) {
+            if (checkSelfPermission(permission) != PackageManager.PERMISSION_GRANTED) return false;
+        }
+        return true;
+    }
+
+    private String[] requiredPermissions() {
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            return new String[]{Manifest.permission.CALL_PHONE, Manifest.permission.READ_PHONE_STATE,
+                    Manifest.permission.READ_CALL_LOG, Manifest.permission.ANSWER_PHONE_CALLS,
+                    Manifest.permission.POST_NOTIFICATIONS};
+        }
+        return new String[]{Manifest.permission.CALL_PHONE, Manifest.permission.READ_PHONE_STATE,
+                Manifest.permission.READ_CALL_LOG, Manifest.permission.ANSWER_PHONE_CALLS};
     }
 
     @Override
@@ -140,8 +160,13 @@ public class MainActivity extends Activity {
         super.onRequestPermissionsResult(request, permissions, results);
         if (request == PERMISSION_REQUEST && waitingForPermissions) {
             waitingForPermissions = false;
-            if (hasCallPermissions()) performPair();
-            else setStatus("Phone permissions are required to place and track SIM calls.", true);
+            updateStatus();
+            if (!hasCallPermissions()) {
+                setStatus("Phone and call-log permissions are both required. If Android is no longer asking, "
+                        + "enable them in Settings > Apps > Telecall Bridge > Permissions.", true);
+                return;
+            }
+            if (!codeInput.getText().toString().trim().isEmpty()) performPair();
         }
     }
 
@@ -176,10 +201,22 @@ public class MainActivity extends Activity {
     }
 
     private void updateStatus() {
-        if (preferences.getString(DEVICE_TOKEN, "").isEmpty()) setStatus("Not paired", true);
-        else if (checkSelfPermission(Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
-            setStatus("Paired, but call-log access is off. Talk time will be estimated instead of measured.", true);
-        } else setStatus("Paired. Waiting for call requests.", false);
+        boolean granted = hasCallPermissions();
+        if (permissionButton != null) permissionButton.setVisibility(granted ? View.GONE : View.VISIBLE);
+        if (preferences.getString(DEVICE_TOKEN, "").isEmpty()) {
+            setStatus(granted ? "Not paired" : "Not paired. Grant phone permissions first.", true);
+        } else if (checkSelfPermission(Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
+            setStatus("Paired, but call-log access is off, so talk time is only estimated. "
+                    + "Tap Grant phone permissions to fix it.", true);
+        } else {
+            setStatus("Paired. Waiting for call requests.", false);
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        updateStatus();
     }
 
     private void setStatus(String value, boolean error) {

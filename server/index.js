@@ -19,7 +19,12 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(value 
 
 // Bumped whenever the call-timing contract changes, so /api/health tells you what is running
 // without guessing from the UI. 'call-log-timing' means talk time excludes ringing.
-const BUILD = { version: 2, features: ['sessions', 'offhook-at', 'call-log-timing', 'estimate-flag'] }
+const BUILD = { version: 3, features: ['sessions', 'offhook-at', 'call-log-timing', 'estimate-flag', 'exact-duration'] }
+
+// How long the line must look idle before the server writes its own estimate. The phone
+// spends up to 20 seconds waiting for the call log to appear, and its reading is the exact
+// one, so this has to outlast that -- otherwise the safety net overwrites the real answer.
+const IDLE_SETTLE_MS = Number(process.env.IDLE_SETTLE_MS || 35_000)
 
 /* ---------- http helpers ---------- */
 
@@ -175,9 +180,7 @@ const reconcileCallState = async (device, callState) => {
   }
 
   if (callState !== 'IDLE') return
-  // Longer than the phone's own idle debounce, so this safety net never concludes a call
-  // ahead of the handset -- the handset's report is the accurate one.
-  const settled = Date.now() - new Date(call.updated_at).getTime() > 10_000
+  const settled = Date.now() - new Date(call.updated_at).getTime() > IDLE_SETTLE_MS
   if (!settled) return
 
   if (call.offhook_at) {
@@ -334,13 +337,14 @@ const server = http.createServer(async (request, response) => {
         }
         await query(
           `UPDATE calls SET status = $2, duration = $3, duration_estimated = $4,
-                  offhook_at  = COALESCE($5::timestamptz, offhook_at),
-                  answered_at = COALESCE($6::timestamptz, answered_at),
-                  ended_at    = COALESCE($7::timestamptz, now()),
+                  started_at  = COALESCE($5::timestamptz, started_at),
+                  offhook_at  = COALESCE($6::timestamptz, offhook_at),
+                  answered_at = COALESCE($7::timestamptz, answered_at),
+                  ended_at    = COALESCE($8::timestamptz, now()),
                   updated_at  = now()
             WHERE id = $1`,
           [call.id, status, finalSeconds, finalEstimated,
-           at(body.offhookAtMs), at(body.answeredAtMs), at(body.endedAtMs)],
+           at(body.startedAtMs), at(body.offhookAtMs), at(body.answeredAtMs), at(body.endedAtMs)],
         )
       } else {
         await query('UPDATE calls SET status = $2, updated_at = now() WHERE id = $1', [call.id, status])
